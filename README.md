@@ -2,6 +2,12 @@
 
 *אור קטן — "small light".*
 
+[![tests](https://github.com/andy-yusin/or-katan/actions/workflows/test.yml/badge.svg)](https://github.com/andy-yusin/or-katan/actions/workflows/test.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![platform: Debian/Ubuntu](https://img.shields.io/badge/platform-Debian%2012%20%7C%20Ubuntu%2022.04%2B-A81D33.svg)](docs/INSTALL.md)
+[![WireGuard + AmneziaWG](https://img.shields.io/badge/tunnels-WireGuard%20%2B%20AmneziaWG-88171A.svg)](#two-ingress-protocols-on-purpose)
+![shell: bash](https://img.shields.io/badge/shell-bash-4EAA25.svg)
+
 A self-hosted routing gateway: **named ingress channels** for who connects, and
 **named egress paths** for how their traffic leaves. You decide, per group and
 per destination, which way out anything takes.
@@ -240,6 +246,23 @@ sudo ./uninstall.sh --purge    # deletes them; every issued config dies
 ```
 
 To update, `git pull` and re-run `sudo ./install.sh`. Keys and clients survive.
+
+## Continuous integration
+
+The `tests` badge is the harness in [test/](test), not a smoke test: every push
+installs the whole stack — routing, firewall, ipsets, DNS chain, client
+lifecycle — into a privileged container for three different configurations,
+installs a second time to assert nothing drifted, and checks that an invalid
+config is rejected and rolled back. Every script is shellcheck-clean at
+`-S warning` in the same run.
+
+Two `gw-doctor` failures are expected and are filtered out by name: the
+placeholder hostname does not resolve, and fixture endpoints are RFC 5737
+documentation addresses that never answer. Any other failure fails the build.
+
+What it does not prove: that AmneziaWG's obfuscation works, or that a handshake
+completes against a real peer. A container has no kernel WireGuard and no
+AmneziaWG module, so those are shimmed — see [test/README.md](test/README.md).
 
 ## Contributing
 

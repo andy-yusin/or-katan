@@ -133,6 +133,11 @@ test/run.sh policy-seeds    # per-destination egress with ipset seeds
 shellcheck -S warning install.sh uninstall.sh setup.sh files/*
 ```
 
+CI (`.github/workflows/test.yml`) runs all of that on every push: shellcheck,
+then the three fixtures in parallel. Its pass criteria are explicit — unexpected
+`gw-doctor` failures, rule-count drift on re-install, and a broken config
+rollback each fail the build.
+
 The container has no kernel WireGuard and no AmneziaWG module; `test/shims/`
 substitutes `wireguard-go` and maps `awg` to `wg`. So the tests prove routing,
 firewall, DNS and lifecycle logic — not that obfuscation works or that a real

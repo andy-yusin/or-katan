@@ -9,7 +9,11 @@ test/run.sh multi-channel                                # the wider config
 ```
 
 `test/run.sh` needs Docker and about two minutes. See [test/README.md](test/README.md)
-for what it actually proves — and for the one FAIL that is expected.
+for what it actually proves — and for the two FAILs that are expected.
+
+CI runs exactly this on every push and pull request: shellcheck, plus all three
+fixtures in parallel. If it passes locally it will pass there, so there is no
+value in pushing to find out.
 
 ## What this project tries to be
 

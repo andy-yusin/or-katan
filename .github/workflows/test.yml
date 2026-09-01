@@ -1,0 +1,65 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - name: Lint every script
+        run: |
+          shellcheck -S warning \
+            install.sh uninstall.sh setup.sh \
+            files/gw-routes.sh files/gw-client files/gw-egress \
+            files/gw-config files/gw-doctor \
+            test/run.sh test/shims/systemctl test/shims/awg test/shims/awg-quick
+
+  install:
+    # Each fixture is a full install of the whole stack into a privileged
+    # container: routing, firewall, ipsets, DNS chain, client lifecycle, and a
+    # second install asserting nothing drifted. Roughly three minutes each.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        fixture: ["", multi-channel, policy-seeds]
+    name: install (${{ matrix.fixture || 'example config' }})
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the harness
+        run: test/run.sh ${{ matrix.fixture }} | tee /tmp/out.log
+      - name: Check the result
+        # Two gw-doctor failures are expected and are not regressions: the
+        # harness uses a placeholder hostname that cannot resolve, and the
+        # fixtures point their egress paths at RFC 5737 documentation
+        # addresses that never answer. Anything else is a real failure.
+        run: |
+          # Every check is an `if`: `grep X && exit 1` would abort the step
+          # under `set -e` when grep finds nothing, which is the passing case.
+          fail=0
+          unexpected=$(grep -a FAIL /tmp/out.log \
+            | grep -avE "does not resolve|never completed a handshake" || true)
+          if [ -n "$unexpected" ]; then
+            echo "unexpected gw-doctor failures:"; echo "$unexpected"; fail=1
+          fi
+          if ! grep -aq "stable (" /tmp/out.log; then
+            echo "the idempotency check did not run"; fail=1
+          fi
+          if grep -aq "DRIFT" /tmp/out.log; then
+            echo "re-installing changed the ruleset"; fail=1
+          fi
+          if grep -aq "BROKEN" /tmp/out.log; then
+            echo "config validation or rollback is broken"; fail=1
+          fi
+          if grep -aq "FAILED to add" /tmp/out.log; then
+            echo "a client could not be issued"; fail=1
+          fi
+          [ "$fail" -eq 0 ] && echo "ok"
+          exit "$fail"
