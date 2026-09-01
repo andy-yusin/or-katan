@@ -1,0 +1,266 @@
+#!/bin/bash
+#
+# gw-config — read, change and validate the gateway's configuration.
+#
+#   gw-config                          show the configuration, grouped
+#   gw-config get <key>                print one value
+#   gw-config set <key> <value>        change one value, validate, apply
+#   gw-config unset <key>              remove a key
+#   gw-config edit                     open $EDITOR, validate, apply
+#   gw-config validate                 check the config without changing anything
+#   gw-config apply                    re-run the installer against the current config
+#   gw-config profiles                 list the available policy profiles
+#   gw-config profile <name>           apply one  (--dry-run to preview)
+#
+# Every mutating command validates before it writes and applies after, so the
+# running gateway and the file on disk do not drift apart. --no-apply writes
+# the change and stops, for when you want to batch several.
+#
+set -euo pipefail
+
+CONF_FILE="${GATEWAY_CONF:-/etc/gateway/gateway.conf}"
+PROFILE_DIR="${GATEWAY_PROFILES:-/etc/gateway/profiles}"
+INSTALLER="/etc/gateway/install.sh"
+
+RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; CYAN=$'\033[0;36m'; DIM=$'\033[2m'; BOLD=$'\033[1m'; NC=$'\033[0m'
+die()  { echo "${RED}ERROR:${NC} $*" >&2; exit 1; }
+info() { echo "  $*"; }
+ok()   { echo "  ${GREEN}✓${NC} $*"; }
+warn() { echo "  ${YELLOW}!${NC} $*"; }
+
+[[ -r "$CONF_FILE" ]] || die "config not readable: $CONF_FILE"
+
+APPLY=yes
+args=()
+for a in "$@"; do
+    case "$a" in
+        --no-apply) APPLY=no ;;
+        *) args+=("$a") ;;
+    esac
+done
+set -- ${args[0]+"${args[@]}"}
+
+# --- helpers -----------------------------------------------------------------
+
+# Read a key straight from the file rather than from the environment, so we see
+# what is written rather than what a default filled in.
+conf_get() {
+    local k="$1" line
+    line="$(grep -E "^${k}=" "$CONF_FILE" | tail -1)" || return 1
+    line="${line#*=}"
+    line="${line%\"}"; line="${line#\"}"
+    printf '%s\n' "$line"
+}
+
+conf_set() {
+    local k="$1" v="$2"
+    if grep -qE "^${k}=" "$CONF_FILE"; then
+        # A key can legitimately appear commented out above its real line; only
+        # the uncommented one is rewritten.
+        sed -i "s|^${k}=.*|${k}=\"${v}\"|" "$CONF_FILE"
+    else
+        printf '%s="%s"\n' "$k" "$v" >> "$CONF_FILE"
+    fi
+}
+
+conf_unset() {
+    local k="$1"
+    grep -qE "^${k}=" "$CONF_FILE" || return 0
+    sed -i "/^${k}=/d" "$CONF_FILE"
+}
+
+# Two shapes: plain settings like GATEWAY_HOST, and the per-object keys whose
+# middle segment is a channel, egress or rule name and is therefore lowercase.
+# Matching only the first shape locks the CLI out of most of the config.
+valid_key() {
+    [[ "$1" =~ ^[A-Z][A-Z0-9_]*$ ]] && return 0
+    [[ "$1" =~ ^(INGRESS|EGRESS|POLICY)_[a-z][a-z0-9_]*_[A-Z][A-Z0-9_]*$ ]] && return 0
+    return 1
+}
+
+# The installer is the only thing that knows how to validate the whole config,
+# so ask it rather than reimplementing half the checks here.
+validate() {
+    [[ -x "$INSTALLER" ]] || { warn "installer not found at ${INSTALLER}; skipping validation"; return 0; }
+    "$INSTALLER" --check-only
+}
+
+apply() {
+    [[ "$APPLY" == yes ]] || { info "not applied (--no-apply); run 'gw-config apply' when ready"; return 0; }
+    [[ -x "$INSTALLER" ]] || die "installer not found at ${INSTALLER} — cannot apply"
+    echo
+    "$INSTALLER"
+}
+
+# Roll the file back if validation fails, so a bad value never survives.
+with_rollback() {
+    local backup; backup="$(mktemp)"
+    cp "$CONF_FILE" "$backup"
+    if ! "$@"; then cp "$backup" "$CONF_FILE"; rm -f "$backup"; die "no changes made"; fi
+    if ! validate; then
+        cp "$backup" "$CONF_FILE"; rm -f "$backup"
+        die "the change did not validate — config rolled back, nothing applied"
+    fi
+    rm -f "$backup"
+}
+
+# --- profiles ----------------------------------------------------------------
+
+profile_meta() {   # <file> <key>
+    grep -E "^# ${2}:" "$1" 2>/dev/null | sed -E "s|^# ${2}:[[:space:]]*||" || true
+}
+
+list_profiles() {
+    [[ -d "$PROFILE_DIR" ]] || die "no profile directory at ${PROFILE_DIR}"
+    local f n t s cur
+    cur="$(conf_get GATEWAY_PROFILE 2>/dev/null || true)"
+    echo "${CYAN}${BOLD}available profiles${NC}"
+    shopt -s nullglob
+    for f in "$PROFILE_DIR"/*.profile; do
+        n="$(basename "$f" .profile)"
+        t="$(profile_meta "$f" title)"
+        s="$(profile_meta "$f" summary)"
+        if [[ "$n" == "$cur" ]]; then
+            printf '  %s%-14s%s %s  %s(applied)%s\n' "$GREEN" "$n" "$NC" "${t:-$n}" "$GREEN" "$NC"
+        else
+            printf '  %-14s %s\n' "$n" "${t:-$n}"
+        fi
+        [[ -n "$s" ]] && printf '  %s%-14s %s%s\n' "$DIM" "" "$s" "$NC"
+    done
+    shopt -u nullglob
+    echo
+    echo "  ${DIM}gw-config profile <name>   apply one${NC}"
+}
+
+apply_profile() {
+    local name="$1" dry="${2:-no}"
+    local f="${PROFILE_DIR}/${name}.profile"
+    [[ -r "$f" ]] || die "no such profile: ${name}  (gw-config profiles)"
+
+    # An egress the profile's rules point at but cannot create for you.
+    local need missing=""
+    for need in $(profile_meta "$f" requires-egress); do
+        [[ " $(conf_get EGRESS_PATHS 2>/dev/null || echo) " == *" ${need} "* ]] || missing="${missing} ${need}"
+    done
+
+    # Everything from the profile except its metadata comments.
+    local body; body="$(grep -vE '^# (title|summary|ingress-type|ingress-mtu|requires-egress|note):' "$f")"
+
+    if [[ "$dry" == yes ]]; then
+        echo "${CYAN}${BOLD}${name} would replace the POLICY_* block with${NC}"
+        echo "$body" | sed 's/^/  /'
+        [[ -n "$missing" ]] && { echo; warn "references egress path(s) that do not exist:${missing}"; }
+        return 0
+    fi
+
+    # Strip every existing POLICY_ line, then append the profile's block. The
+    # rest of the file — channels, egress paths, DNS, everything — is untouched.
+    sed -i '/^POLICY_/d' "$CONF_FILE"
+    {
+        echo
+        echo "# --- policy from profile '${name}' — replaced wholesale by gw-config profile ---"
+        echo "$body" | sed '/^$/N;/^\n$/D'
+    } >> "$CONF_FILE"
+    conf_set GATEWAY_PROFILE "$name"
+    ok "applied profile '${name}'"
+
+    local n
+    while IFS= read -r n; do [[ -n "$n" ]] && info "${DIM}${n}${NC}"; done < <(profile_meta "$f" note)
+
+    if [[ -n "$missing" ]]; then
+        warn "these rules point at egress path(s) you have not declared:${missing}"
+        for need in $missing; do
+            info "${DIM}gw-egress add ${need} --endpoint <host>:<port> --pubkey <key> --address <ip/cidr>${NC}"
+        done
+        warn "until then those rules are inert — the installer will refuse to route to a path that does not exist"
+        return 0
+    fi
+}
+
+show_all() {
+    local k
+    echo "${CYAN}${BOLD}gateway${NC}"
+    for k in GATEWAY_HOST GATEWAY_PROFILE; do
+        printf '  %-24s %s\n' "$k" "$(conf_get "$k" 2>/dev/null || echo "${DIM}unset${NC}")"
+    done
+    echo
+    echo "${CYAN}${BOLD}ingress channels${NC}  ${DIM}$(conf_get INGRESS_CHANNELS 2>/dev/null)${NC}"
+    for c in $(conf_get INGRESS_CHANNELS 2>/dev/null || true); do
+        printf '  %-10s %-5s %-18s egress=%-10s isolate=%s\n' "$c" \
+            "$(conf_get "INGRESS_${c}_TYPE" 2>/dev/null || echo wg)" \
+            "$(conf_get "INGRESS_${c}_NET" 2>/dev/null)" \
+            "$(conf_get "INGRESS_${c}_EGRESS" 2>/dev/null)" \
+            "$(conf_get "INGRESS_${c}_ISOLATE" 2>/dev/null || echo no)"
+    done
+    echo
+    echo "${CYAN}${BOLD}egress paths${NC}  ${DIM}$(conf_get EGRESS_PATHS 2>/dev/null)${NC}"
+    for e in $(conf_get EGRESS_PATHS 2>/dev/null || true); do
+        local t; t="$(conf_get "EGRESS_${e}_TYPE" 2>/dev/null || echo direct)"
+        if [[ "$t" == "direct" ]]; then
+            printf '  %-10s %s\n' "$e" "this gateway's own uplink"
+        else
+            printf '  %-10s %-5s %s\n' "$e" "$(conf_get "EGRESS_${e}_PROTO" 2>/dev/null || echo wg)" \
+                "$(conf_get "EGRESS_${e}_ENDPOINT" 2>/dev/null || conf_get "EGRESS_${e}_CONF_FILE" 2>/dev/null)"
+        fi
+    done
+    echo
+    echo "${CYAN}${BOLD}destination policy${NC}  ${DIM}$(conf_get POLICY_RULES 2>/dev/null)${NC}"
+    for r in $(conf_get POLICY_RULES 2>/dev/null || true); do
+        printf '  %-10s -> %-10s %s\n' "$r" "$(conf_get "POLICY_${r}_EGRESS" 2>/dev/null)" \
+            "${DIM}$(conf_get "POLICY_${r}_DOMAINS" 2>/dev/null | cut -c1-52)${NC}"
+    done
+    echo
+    echo "${CYAN}${BOLD}dns${NC}"
+    for k in DNS_STACK DNS_FILTER_ENABLE DNS_EGRESS DNSCRYPT_RESOLVERS DNS_FALLBACK; do
+        printf '  %-24s %s\n' "$k" "$(conf_get "$k" 2>/dev/null || echo "${DIM}default${NC}")"
+    done
+}
+
+# --- dispatch ----------------------------------------------------------------
+
+cmd="${1:-show}"
+case "$cmd" in
+    show|"")  show_all ;;
+
+    get)      [[ -n "${2:-}" ]] || die "usage: gw-config get <key>"
+              valid_key "$2" || die "not a config key: $2"
+              conf_get "$2" || die "not set: $2" ;;
+
+    set)      [[ $EUID -eq 0 ]] || die "must run as root"
+              [[ -n "${2:-}" && $# -ge 3 ]] || die "usage: gw-config set <key> <value>"
+              valid_key "$2" || die "not a config key: $2  (keys are UPPER_SNAKE_CASE)"
+              old="$(conf_get "$2" 2>/dev/null || echo)"
+              with_rollback conf_set "$2" "$3"
+              ok "${2}: ${old:-unset} -> $3"
+              apply ;;
+
+    unset)    [[ $EUID -eq 0 ]] || die "must run as root"
+              [[ -n "${2:-}" ]] || die "usage: gw-config unset <key>"
+              valid_key "$2" || die "not a config key: $2"
+              with_rollback conf_unset "$2"
+              ok "removed ${2}"
+              apply ;;
+
+    edit)     [[ $EUID -eq 0 ]] || die "must run as root"
+              ed="${EDITOR:-vi}"
+              with_rollback "$ed" "$CONF_FILE"
+              ok "config valid"
+              apply ;;
+
+    validate) validate && ok "configuration is valid" ;;
+
+    apply)    [[ $EUID -eq 0 ]] || die "must run as root"
+              validate || die "refusing to apply an invalid config"
+              APPLY=yes; apply ;;
+
+    profiles) list_profiles ;;
+
+    profile)  [[ -n "${2:-}" ]] || { list_profiles; exit 0; }
+              if [[ "${3:-}" == "--dry-run" ]]; then apply_profile "$2" yes; exit 0; fi
+              [[ $EUID -eq 0 ]] || die "must run as root"
+              with_rollback apply_profile "$2"
+              apply ;;
+
+    -h|--help) sed -n '2,20p' "$0" | sed 's/^#//;s/^ //' ;;
+    *) die "unknown command: ${cmd}   (gw-config --help)" ;;
+esac

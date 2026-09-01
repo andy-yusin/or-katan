@@ -77,7 +77,7 @@ see what your clients look up.
 
 ## Requirements
 
-- Ubuntu 22.04/24.04 or Debian 12, root access. A 1-core / 1 GB VPS is plenty.
+- Ubuntu 22.04/24.04 or Debian 12, root access. A 1-core / 512 MB VPS is plenty.
 - A DNS name pointing at it. Strongly preferred over a bare IP: the name is
   baked into every client config, so you can move the box and clients follow.
 - One open UDP port per ingress channel.
@@ -87,14 +87,32 @@ see what your clients look up.
 ```bash
 git clone https://github.com/andy-yusin/or-katan.git
 cd or-katan
-cp gateway.conf.example gateway.conf
-$EDITOR gateway.conf          # declare your channels and egress paths
-sudo ./install.sh
+sudo ./setup.sh
 ```
+
+`setup.sh` asks what you want, writes `gateway.conf`, and offers to install.
+Every question has a default and nothing is written until the end. To write the
+config by hand instead, start from `gateway.conf.example` and run
+`sudo ./install.sh`.
 
 The installer validates the whole config before touching anything — duplicate
 ports, overlapping subnets, channels pointing at egress paths that do not exist.
 Re-run it after any change: it never rotates keys and never drops clients.
+
+Full prerequisites, what the installer does step by step, and how to verify it
+worked: [docs/INSTALL.md](docs/INSTALL.md).
+
+### Profiles
+
+A profile is a ready-made destination policy you can apply at any time:
+
+```bash
+gw-config profiles           # what is available
+gw-config profile ru         # apply one
+```
+
+`none`, `split-home`, and `ru` ship with it; writing your own is a text file.
+See [profiles/README.md](profiles/README.md).
 
 ## Daily use
 
@@ -107,7 +125,15 @@ Re-run it after any change: it never rotates keys and never drops clients.
 | `gw-egress` | every path, its health, and who uses it |
 | `gw-egress set family backup` | move one channel, live |
 | `gw-egress set all direct` | move everything (e.g. an exit went down) |
+| `gw-egress add uk --endpoint …` | declare a new exit; generates a key if you omit one |
+| `gw-egress remove uk` | drop one nothing points at |
+| `gw-config` | the whole configuration, grouped |
+| `gw-config set DNS_FILTER_ENABLE no` | change one setting, validated and applied |
+| `gw-config profile ru` | swap the destination policy wholesale |
 | `gw-doctor` | check every layer |
+
+Anything that changes the config validates first and rolls back if the result
+would not install, so a typo cannot take the gateway down.
 
 Client configs land in `/etc/gateway/clients/`. They contain private keys — send
 them over something end-to-end encrypted and delete your copy afterwards.
@@ -117,10 +143,12 @@ each other by name.
 
 ## Documentation
 
+- [docs/INSTALL.md](docs/INSTALL.md) — prerequisites, the install itself, and verifying it
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the routing and DNS work
 - [docs/CHANNELS.md](docs/CHANNELS.md) — designing channels, egress paths and policy
 - [docs/EXIT-SERVER.md](docs/EXIT-SERVER.md) — standing up a tunnel egress
 - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — the failure modes worth knowing in advance
+- [profiles/README.md](profiles/README.md) — ready-made destination policies
 
 ## Uninstall
 

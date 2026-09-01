@@ -6,6 +6,19 @@
 #   gw-egress set <channel> <egress>   repoint one channel
 #   gw-egress set all <egress>         repoint every channel
 #   gw-egress test                     prove where each channel actually exits
+#   gw-egress add <name> [options]     declare a new tunnel exit
+#   gw-egress remove <name>            remove one nothing points at
+#
+# Options for add:
+#   --endpoint <host:port>   the exit server
+#   --pubkey <key>           its public key
+#   --privkey <key>          this gateway's private key on that peer
+#                            (omitted: one is generated and its public key printed)
+#   --psk <key>              preshared key, if the exit uses one
+#   --address <ip/cidr>      this gateway's address inside the tunnel
+#   --proto <wg|awg>         default wg
+#   --port <n>               local listen port; default: first free from 51900
+#   --conf-file <path>       a provider-supplied .conf instead of the above
 #
 # Changes are live: clients stay connected to their ingress interface and only
 # the path underneath them changes. The choice is written back to the config,
@@ -24,7 +37,7 @@ die() { echo "${RED}ERROR:${NC} $*" >&2; exit 1; }
 [[ -r "$CONF_FILE" ]] || die "config not readable: $CONF_FILE"
 # shellcheck disable=SC1090
 source "$CONF_FILE"
-: "${INGRESS_CHANNELS:=}"; : "${EGRESS_PATHS:=direct}"
+: "${INGRESS_CHANNELS:=}"; : "${EGRESS_PATHS:=direct}"; : "${POLICY_RULES:=}"
 
 DEF_IF="$(ip route show default | awk '/default/ {print $5; exit}')"
 
@@ -100,12 +113,130 @@ show_test() {
     done
 }
 
+conf_set() {
+    local k="$1" v="$2"
+    if grep -qE "^${k}=" "$CONF_FILE"; then
+        sed -i "s|^${k}=.*|${k}=\"${v}\"|" "$CONF_FILE"
+    else
+        printf '%s="%s"\n' "$k" "$v" >> "$CONF_FILE"
+    fi
+}
+
+# The first local port from 51900 that no egress already claims. Two WireGuard
+# interfaces cannot share one, and a collision fails at bring-up rather than
+# at validation, so pick it here instead of making the operator track it.
+next_free_port() {
+    local p=51900 e used
+    while :; do
+        used=no
+        for e in $EGRESS_PATHS; do [[ "$(cfg "EGRESS_${e}_PORT")" == "$p" ]] && used=yes; done
+        grep -qE "^INGRESS_[a-z0-9_]+_PORT=\"?${p}\"?$" "$CONF_FILE" && used=yes
+        [[ "$used" == no ]] && { echo "$p"; return 0; }
+        p=$((p + 1))
+    done
+}
+
+cmd_add() {
+    local name="${1:-}"; shift || true
+    [[ -n "$name" ]] || die "usage: gw-egress add <name> [options]"
+    [[ "$name" =~ ^[a-z][a-z0-9_]*$ ]] || die "egress names are lowercase letters, digits and _"
+    egress_exists "$name" && die "'${name}' is already an egress path"
+
+    local proto=wg endpoint="" pubkey="" privkey="" psk="" address="" port="" conffile=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --endpoint)  endpoint="${2:-}"; shift 2 ;;
+            --pubkey)    pubkey="${2:-}";   shift 2 ;;
+            --privkey)   privkey="${2:-}";  shift 2 ;;
+            --psk)       psk="${2:-}";      shift 2 ;;
+            --address)   address="${2:-}";  shift 2 ;;
+            --proto)     proto="${2:-}";    shift 2 ;;
+            --port)      port="${2:-}";     shift 2 ;;
+            --conf-file) conffile="${2:-}"; shift 2 ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+    [[ "$proto" == "wg" || "$proto" == "awg" ]] || die "--proto must be wg or awg"
+    [[ -n "$port" ]] || port="$(next_free_port)"
+
+    if [[ -n "$conffile" ]]; then
+        [[ -r "$conffile" ]] || die "cannot read ${conffile}"
+        conf_set "EGRESS_${name}_TYPE" "tunnel"
+        conf_set "EGRESS_${name}_CONF_FILE" "$conffile"
+        conf_set "EGRESS_${name}_PORT" "$port"
+    else
+        [[ -n "$endpoint" ]] || die "--endpoint <host:port> is required (or --conf-file)"
+        [[ -n "$pubkey" ]]   || die "--pubkey is required (or --conf-file)"
+        [[ -n "$address" ]]  || die "--address <ip/cidr> is required (or --conf-file)"
+        # Generating the key here means the operator never has to invent one,
+        # and the public half is printed so it can be pasted into the exit.
+        local generated=no
+        if [[ -z "$privkey" ]]; then
+            privkey="$( [[ "$proto" == awg ]] && awg genkey || wg genkey )"
+            generated=yes
+        fi
+        conf_set "EGRESS_${name}_TYPE" "tunnel"
+        conf_set "EGRESS_${name}_PROTO" "$proto"
+        conf_set "EGRESS_${name}_ENDPOINT" "$endpoint"
+        conf_set "EGRESS_${name}_PUBKEY" "$pubkey"
+        conf_set "EGRESS_${name}_PRIVKEY" "$privkey"
+        conf_set "EGRESS_${name}_PSK" "$psk"
+        conf_set "EGRESS_${name}_ADDRESS" "$address"
+        conf_set "EGRESS_${name}_PORT" "$port"
+        if [[ "$generated" == yes ]]; then
+            echo "${YELLOW}A key pair was generated for this gateway. Add this peer on the exit server:${NC}"
+            echo
+            echo "  [Peer]"
+            echo "  PublicKey = $(printf '%s' "$privkey" | { [[ "$proto" == awg ]] && awg pubkey || wg pubkey; })"
+            echo "  AllowedIPs = ${address%%/*}/32"
+            echo
+        fi
+    fi
+    conf_set EGRESS_PATHS "${EGRESS_PATHS} ${name}"
+    echo "${GREEN}declared egress '${name}' on local port ${port}${NC}"
+    echo "  ${BOLD}It is not live until you apply it:${NC} gw-config apply"
+    echo "  Then point something at it:  gw-egress set <channel> ${name}"
+}
+
+cmd_remove() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "usage: gw-egress remove <name>"
+    egress_exists "$name" || die "'${name}' is not an egress path"
+    [[ "$name" == "direct" ]] && die "'direct' is this box's own uplink and cannot be removed"
+
+    # Refuse while anything still routes to it: removing it would leave those
+    # channels and rules pointing at a path that does not exist.
+    local c users=""
+    for c in $INGRESS_CHANNELS; do
+        [[ "$(ch_egress "$c")" == "$name" ]] && users="${users} ${c}"
+    done
+    local r
+    for r in ${POLICY_RULES:-}; do
+        [[ "$(cfg "POLICY_${r}_EGRESS")" == "$name" ]] && users="${users} policy:${r}"
+    done
+    [[ -z "$users" ]] || die "still in use by:${users} — repoint those first (gw-egress set <channel> <other>)"
+
+    local dev; dev="$(eg_iface "$name")"
+    if ip link show "$dev" &>/dev/null; then
+        if [[ -f "/etc/amnezia/amneziawg/${dev}.conf" ]]; then awg-quick down "$dev" || true; else wg-quick down "$dev" || true; fi
+    fi
+    sed -i "/^EGRESS_${name}_/d" "$CONF_FILE"
+    local rest=""
+    for e in $EGRESS_PATHS; do [[ "$e" == "$name" ]] || rest="${rest} ${e}"; done
+    conf_set EGRESS_PATHS "${rest# }"
+    echo "${GREEN}removed egress '${name}'${NC}"
+    echo "  ${BOLD}Apply to clean up its routing table and rules:${NC} gw-config apply"
+}
+
 cmd="${1:-status}"
 case "$cmd" in
     status|"") show_status; echo; show_test; exit 0 ;;
     test)      show_test; exit 0 ;;
+    add)       [[ $EUID -eq 0 ]] || die "must run as root"; shift; cmd_add "$@"; exit 0 ;;
+    remove)    [[ $EUID -eq 0 ]] || die "must run as root"; shift; cmd_remove "$@"; exit 0 ;;
     set)       ;;
-    *) die "usage: gw-egress [status|test|set <channel|all> <egress>]" ;;
+    -h|--help) sed -n '2,30p' "$0" | sed 's/^#//;s/^ //'; exit 0 ;;
+    *) die "usage: gw-egress [status|test|add|remove|set <channel|all> <egress>]" ;;
 esac
 
 target_ch="${2:-}"; target_eg="${3:-}"

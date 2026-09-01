@@ -75,6 +75,24 @@ done
 gw-client list || true
 
 echo
+echo "==> config CLI"
+gw-config validate >/dev/null 2>&1 && echo "  gw-config validate: ok" || echo "  gw-config validate: FAILED"
+n=$(gw-config profiles 2>/dev/null | grep -cE "^  [a-z]") || n=0
+echo "  profiles listed: $n"
+h=$(gw-config get GATEWAY_HOST 2>/dev/null) && echo "  reads a plain key: $h" || echo "  FAILED to read GATEWAY_HOST"
+c=$(. /work/gateway.conf; echo "$INGRESS_CHANNELS" | awk '{print $1}')
+k=$(gw-config get "INGRESS_${c}_NET" 2>/dev/null) && echo "  reads a per-object key: INGRESS_${c}_NET=$k" \
+    || echo "  FAILED to read INGRESS_${c}_NET"
+# A value the installer must reject, to prove the rollback path is wired up.
+if gw-config set "INGRESS_${c}_NET" "not-a-subnet" >/dev/null 2>&1; then
+    echo "  ROLLBACK BROKEN: an invalid value was accepted"
+else
+    [ "$(gw-config get "INGRESS_${c}_NET")" = "$k" ] \
+        && echo "  rejects an invalid value and rolls back" \
+        || echo "  ROLLBACK BROKEN: value is now $(gw-config get "INGRESS_${c}_NET")"
+fi
+
+echo
 echo "==> idempotency: install again, rule counts must not move"
 before="$(ip rule show | wc -l):$(iptables-save | wc -l):$(ip -o link show | wc -l)"
 ./install.sh > /tmp/install2.log 2>&1 || { echo "REINSTALL FAILED"; tail -20 /tmp/install2.log; exit 1; }

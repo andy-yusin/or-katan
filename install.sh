@@ -22,9 +22,11 @@ ok()   { printf '    %s✓%s %s\n' "$GREEN" "$NC" "$1"; }
 warn() { printf '    %s!%s %s\n' "$YELLOW" "$NC" "$1"; }
 die()  { printf '\n%sERROR:%s %s\n' "$RED" "$NC" "$1" >&2; exit 1; }
 
+CHECK_ONLY=no
 for arg in "$@"; do
     case "$arg" in
         -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+        --check-only) CHECK_ONLY=yes ;;
         *) die "unknown option: $arg" ;;
     esac
 done
@@ -132,6 +134,10 @@ for e in $EGRESS_PATHS; do
     [[ "$(eg_type "$e")" == "tunnel" && "$(eg_proto "$e")" == "awg" ]] && NEED_AWG="yes"
 done
 
+# Everything above this line reads; everything below it writes. --check-only is
+# what gw-config uses to validate a change before committing it to the file.
+[[ "$CHECK_ONLY" == "no" ]] || { echo; ok "configuration is valid"; exit 0; }
+
 # =============================================================================
 step "Packages"
 # =============================================================================
@@ -192,17 +198,40 @@ step "Layout"
 # =============================================================================
 mkdir -p "$ETC_DIR" "${ETC_DIR}/clients" "${ETC_DIR}/keys"
 chmod 700 "$ETC_DIR" "${ETC_DIR}/clients" "${ETC_DIR}/keys"
-if [[ -f "$CONF_DST" ]] && ! cmp -s "$CONF_SRC" "$CONF_DST"; then
-    cp -a "$CONF_DST" "${CONF_DST}.bak-$(date +%Y%m%d-%H%M%S)"
-    warn "${CONF_DST} differs from ${CONF_SRC} and is being overwritten (backup kept)"
-    warn "note: gw-egress writes channel egress choices into the installed copy — mirror them back"
+if [[ "$CONF_SRC" != "$CONF_DST" ]]; then
+    if [[ -f "$CONF_DST" ]] && ! cmp -s "$CONF_SRC" "$CONF_DST"; then
+        cp -a "$CONF_DST" "${CONF_DST}.bak-$(date +%Y%m%d-%H%M%S)"
+        warn "${CONF_DST} differs from ${CONF_SRC} and is being overwritten (backup kept)"
+        warn "note: gw-config and gw-egress write to the installed copy — mirror changes back"
+    fi
+    install -m 600 "$CONF_SRC" "$CONF_DST"
 fi
-install -m 600 "$CONF_SRC" "$CONF_DST"
+
+# /etc/gateway holds a complete copy of the kit, so the gateway can be
+# re-applied — by gw-config, or by hand — long after the clone it came from is
+# gone. Running /etc/gateway/install.sh is then the same as running this one.
+if [[ "$KIT_DIR" != "$ETC_DIR" ]]; then
+    mkdir -p "${ETC_DIR}/templates" "${ETC_DIR}/profiles"
+    install -m 700 "${KIT_DIR}/install.sh"   "${ETC_DIR}/install.sh"
+    install -m 700 "${KIT_DIR}/uninstall.sh" "${ETC_DIR}/uninstall.sh"
+    install -m 700 "${KIT_DIR}/setup.sh"     "${ETC_DIR}/setup.sh"
+    install -m 600 "${KIT_DIR}"/templates/*.tmpl "${ETC_DIR}/templates/"
+    mkdir -p "${ETC_DIR}/files"
+    install -m 700 "${KIT_DIR}"/files/gw-* "${ETC_DIR}/files/"
+    # Profiles the operator wrote themselves are theirs; only add what shipped.
+    for pf in "${KIT_DIR}"/profiles/*.profile; do
+        [[ -e "$pf" ]] || continue
+        install -m 644 "$pf" "${ETC_DIR}/profiles/$(basename "$pf")"
+    done
+fi
+
 install -m 700 "${KIT_DIR}/files/gw-routes.sh" "${ETC_DIR}/gw-routes.sh"
 install -m 755 "${KIT_DIR}/files/gw-client" /usr/local/bin/gw-client
 install -m 755 "${KIT_DIR}/files/gw-egress" /usr/local/bin/gw-egress
 install -m 755 "${KIT_DIR}/files/gw-doctor" /usr/local/bin/gw-doctor
-ok "config at ${CONF_DST}; tools: gw-client, gw-egress, gw-doctor"
+install -m 755 "${KIT_DIR}/files/gw-config" /usr/local/bin/gw-config
+install -m 755 "${KIT_DIR}/setup.sh" /usr/local/bin/gw-setup
+ok "config at ${CONF_DST}; tools: gw-client, gw-egress, gw-config, gw-doctor, gw-setup"
 
 # Keys live outside the interface configs so re-running the installer never
 # rotates them — that would silently invalidate every client config ever issued.
