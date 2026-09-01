@@ -36,6 +36,20 @@ step "Preflight"
 # =============================================================================
 [[ $EUID -eq 0 ]] || die "run as root (sudo ./install.sh)"
 [[ -r "$CONF_SRC" ]] || die "no gateway.conf here. Start with: cp gateway.conf.example gateway.conf && \$EDITOR gateway.conf"
+
+# gw-config, gw-egress and `gw-config profile` all write to the installed copy,
+# so after the first install that is usually the one carrying the real state.
+# Upgrading from a clone must not silently revert them — take whichever config
+# was edited last, and say which one that was.
+if [[ "$CONF_SRC" != "$CONF_DST" && -f "$CONF_DST" ]] && ! cmp -s "$CONF_SRC" "$CONF_DST"; then
+    if [[ "$CONF_DST" -nt "$CONF_SRC" ]]; then
+        warn "${CONF_DST} is newer than ${CONF_SRC} — installing from it, not from here"
+        warn "the tools write there; copy it over ${CONF_SRC} if you want the two in sync"
+        CONF_SRC="$CONF_DST"
+    else
+        warn "${CONF_SRC} is newer and will replace ${CONF_DST} (a backup is kept)"
+    fi
+fi
 command -v apt-get >/dev/null || die "this installer targets Debian/Ubuntu (apt-get not found)"
 . /etc/os-release 2>/dev/null || true
 info "host: ${PRETTY_NAME:-unknown}  kernel $(uname -r)"
@@ -199,10 +213,10 @@ step "Layout"
 mkdir -p "$ETC_DIR" "${ETC_DIR}/clients" "${ETC_DIR}/keys"
 chmod 700 "$ETC_DIR" "${ETC_DIR}/clients" "${ETC_DIR}/keys"
 if [[ "$CONF_SRC" != "$CONF_DST" ]]; then
+    # Preflight already decided which of the two wins; if we got here the one
+    # in the kit is it, so the installed copy is backed up before it goes.
     if [[ -f "$CONF_DST" ]] && ! cmp -s "$CONF_SRC" "$CONF_DST"; then
         cp -a "$CONF_DST" "${CONF_DST}.bak-$(date +%Y%m%d-%H%M%S)"
-        warn "${CONF_DST} differs from ${CONF_SRC} and is being overwritten (backup kept)"
-        warn "note: gw-config and gw-egress write to the installed copy — mirror changes back"
     fi
     install -m 600 "$CONF_SRC" "$CONF_DST"
 fi
@@ -226,6 +240,7 @@ if [[ "$KIT_DIR" != "$ETC_DIR" ]]; then
 fi
 
 install -m 700 "${KIT_DIR}/files/gw-routes.sh" "${ETC_DIR}/gw-routes.sh"
+install -m 700 "${KIT_DIR}/files/gw-lib.sh"    "${ETC_DIR}/gw-lib.sh"
 install -m 755 "${KIT_DIR}/files/gw-client" /usr/local/bin/gw-client
 install -m 755 "${KIT_DIR}/files/gw-egress" /usr/local/bin/gw-egress
 install -m 755 "${KIT_DIR}/files/gw-doctor" /usr/local/bin/gw-doctor
@@ -255,18 +270,51 @@ render() {
     printf '%s\n' "$content" > "$out"; chmod 600 "$out"
 }
 
+# Which interface configs this run actually rewrote. Restarting an interface
+# whose config came out byte-identical costs every client on it a reconnect and
+# changes nothing, so the two are tracked apart.
+CHANGED_CONFS=""
+conf_changed() { [[ " ${CHANGED_CONFS} " == *" ${1} "* ]] && echo yes || echo no; }
+
+# Take a copy of a config about to be regenerated, so we can tell afterwards
+# whether the rewrite changed anything. Prints the copy's path, or nothing when
+# there was no file to begin with.
+snapshot() {
+    local f="$1" t
+    [[ -f "$f" ]] || { echo ""; return 0; }
+    t="$(mktemp)"; cp -a "$f" "$t"; echo "$t"
+}
+
+# Decide what the rewrite amounted to: nothing (drop the snapshot and say so),
+# or a real change (keep one backup and mark the config for a restart).
+settle() {   # <file> <snapshot-path-or-empty>
+    local f="$1" s="$2"
+    if [[ -n "$s" ]] && cmp -s "$s" "$f"; then rm -f "$s"; return 0; fi
+    if [[ -n "$s" ]]; then
+        cp -a "$s" "${f}.bak-$(date +%Y%m%d-%H%M%S)"
+        # Each of these holds the gateway's private key and every peer's keys,
+        # and one would otherwise be minted on every apply — `gw-config set`
+        # included. Keep a short history, not a growing pile of live key material.
+        ls -1t "${f}".bak-* 2>/dev/null | tail -n +4 | xargs -r rm -f || true
+        rm -f "$s"
+    fi
+    CHANGED_CONFS="${CHANGED_CONFS} ${f}"
+    return 0
+}
+
 # Re-running must never cost anyone their clients: everything from the first
 # [Peer] block onward is carried into the regenerated file.
 write_iface_conf() {
     local out="$1"; shift
-    local peers=""
+    local peers="" snap
+    snap="$(snapshot "$out")"
     if [[ -f "$out" ]]; then
         peers="$(awk '/^\[Peer\]/{p=1} p' "$out")"
-        cp -a "$out" "${out}.bak-$(date +%Y%m%d-%H%M%S)"
         [[ -n "$peers" ]] && info "$(basename "$out"): keeping existing clients, refreshing [Interface]"
     fi
     render "$@"
     [[ -n "$peers" ]] && printf '\n%s\n' "$peers" >> "$out"
+    settle "$out" "$snap"
     return 0
 }
 
@@ -280,6 +328,7 @@ for e in $EGRESS_PATHS; do
     fi
     conf="$(eg_conf "$e")"
     mkdir -p "$(dirname "$conf")"; chmod 700 "$(dirname "$conf")" 2>/dev/null || true
+    snap="$(snapshot "$conf")"
     src="$(cfg "EGRESS_${e}_CONF_FILE")"
     if [[ -n "$src" ]]; then
         # A provider-supplied config, used verbatim except for the two things
@@ -303,6 +352,7 @@ for e in $EGRESS_PATHS; do
             PSK_LINE "$psk_line" ENDPOINT "$(cfg "EGRESS_${e}_ENDPOINT")"
         ok "${e}: $(eg_iface "$e") -> $(cfg "EGRESS_${e}_ENDPOINT")"
     fi
+    settle "$conf" "$snap"
 done
 
 # =============================================================================
@@ -600,28 +650,51 @@ EOF
 done
 systemctl daemon-reload
 
-start_unit() {
-    local unit="$1"
+# A restart is only ever warranted by a config that actually moved: an apply
+# that changed something unrelated — most of what `gw-config set` does — must
+# not drop everyone connected.
+start_unit() {   # <unit> [changed: yes|no, default yes]
+    local unit="$1" changed="${2:-yes}"
     systemctl enable "$unit" >/dev/null 2>&1 || true
-    if systemctl is-active --quiet "$unit"; then
-        systemctl restart "$unit" || die "$unit failed to restart — journalctl -u $unit -n50"
-    else
+    if ! systemctl is-active --quiet "$unit"; then
         systemctl start "$unit" || die "$unit failed to start — journalctl -u $unit -n50"
+    elif [[ "$changed" == "yes" ]]; then
+        systemctl restart "$unit" || die "$unit failed to restart — journalctl -u $unit -n50"
     fi
 }
 
 for e in $EGRESS_PATHS; do
     [[ "$(eg_type "$e")" == "tunnel" ]] || continue
-    start_unit "$(eg_unit "$e")"; ok "egress ${e} up"
+    start_unit "$(eg_unit "$e")" "$(conf_changed "$(eg_conf "$e")")"; ok "egress ${e} up"
 done
+# The filter holds :53 on the channel gateway addresses. Switched off, dnsmasq
+# is what binds those — so the filter has to be stopped before dnsmasq is asked
+# to start, or dnsmasq dies on "address already in use" and clients keep being
+# resolved by the very thing that was just disabled.
+if [[ "$DNS_FILTER_ENABLE" != "yes" && -f /etc/systemd/system/AdGuardHome.service ]]; then
+    systemctl disable --now AdGuardHome >/dev/null 2>&1 || true
+    ok "DNS filter stopped and disabled (DNS_FILTER_ENABLE=no)"
+fi
 if [[ "$DNS_STACK" == "yes" ]]; then
     start_unit dnscrypt-proxy; ok "dnscrypt-proxy up"
     start_unit dnsmasq;        ok "dnsmasq up"
 fi
 for c in $INGRESS_CHANNELS; do
-    start_unit "$(ch_unit "$c")"; ok "channel ${c} up"
+    if [[ "$(conf_changed "$(ch_conf "$c")")" == "yes" ]]; then
+        start_unit "$(ch_unit "$c")"; ok "channel ${c} up"
+    else
+        start_unit "$(ch_unit "$c")" no
+        # The interface is untouched, but policy, marks, NAT and routing tables
+        # may all have moved under it. Re-staging them is idempotent and costs
+        # nobody their connection — which is the whole point of not restarting.
+        "${ETC_DIR}/gw-routes.sh" up "$c" >/dev/null \
+            || die "routing for channel ${c} could not be staged — ${ETC_DIR}/gw-routes.sh up ${c}"
+        ok "channel ${c} up (unchanged; routing re-staged)"
+    fi
 done
-[[ "$DNS_FILTER_ENABLE" == "yes" ]] && { start_unit AdGuardHome; ok "DNS filter up"; }
+if [[ "$DNS_FILTER_ENABLE" == "yes" ]]; then
+    start_unit AdGuardHome; ok "DNS filter up"
+fi
 
 # =============================================================================
 step "Verification"

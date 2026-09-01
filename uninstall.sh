@@ -64,7 +64,8 @@ done
 ok "routing tables and rules cleared"
 
 step "Removing tools and units"
-rm -f /usr/local/bin/gw-client /usr/local/bin/gw-egress /usr/local/bin/gw-doctor
+rm -f /usr/local/bin/gw-client /usr/local/bin/gw-egress /usr/local/bin/gw-doctor \
+      /usr/local/bin/gw-config /usr/local/bin/gw-setup
 rm -rf /etc/systemd/system/wg-quick@in-*.service.d /etc/systemd/system/awg-quick@in-*.service.d
 rm -f /etc/systemd/system/dnscrypt-proxy.service.d/10-gateway.conf
 rm -f /etc/systemd/networkd.conf.d/10-keep-foreign-rules.conf
@@ -97,6 +98,9 @@ if [[ "$PURGE" == "yes" ]]; then
     rm -rf "$ETC_DIR"
     rm -f /etc/wireguard/in-*.conf /etc/wireguard/out-*.conf
     rm -f /etc/amnezia/amneziawg/in-*.conf /etc/amnezia/amneziawg/out-*.conf
+    # The timestamped backups hold the same private keys; a purge that left
+    # them behind would not be one.
+    rm -f /etc/wireguard/*.conf.bak-* /etc/amnezia/amneziawg/*.conf.bak-*
     ok "deleted — every client config ever issued is now permanently invalid"
 else
     cat <<EOF

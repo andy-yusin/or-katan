@@ -36,6 +36,13 @@ die() { echo "${RED}ERROR:${NC} $*" >&2; exit 1; }
 [[ -r "$CONF_FILE" ]] || die "config not readable: $CONF_FILE"
 # shellcheck disable=SC1090
 source "$CONF_FILE"
+
+LIB="/etc/gateway/gw-lib.sh"
+[[ -r "$LIB" ]] || LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gw-lib.sh"
+[[ -r "$LIB" ]] || die "gw-lib.sh not found (expected /etc/gateway/gw-lib.sh) — re-run install.sh"
+# shellcheck source=files/gw-lib.sh
+# shellcheck disable=SC1090
+source "$LIB"
 : "${INGRESS_CHANNELS:=}"; : "${EGRESS_PATHS:=direct}"; : "${POLICY_RULES:=}"
 
 DEF_IF="$(ip route show default | awk '/default/ {print $5; exit}')"
@@ -112,14 +119,7 @@ show_test() {
     done
 }
 
-conf_set() {
-    local k="$1" v="$2"
-    if grep -qE "^${k}=" "$CONF_FILE"; then
-        sed -i "s|^${k}=.*|${k}=\"${v}\"|" "$CONF_FILE"
-    else
-        printf '%s="%s"\n' "$k" "$v" >> "$CONF_FILE"
-    fi
-}
+# conf_set comes from gw-lib.sh, shared with gw-config.
 
 # The first local port from 51900 that no egress already claims. Two WireGuard
 # interfaces cannot share one, and a collision fails at bring-up rather than
@@ -156,7 +156,14 @@ cmd_add() {
         esac
     done
     [[ "$proto" == "wg" || "$proto" == "awg" ]] || die "--proto must be wg or awg"
-    [[ -n "$port" ]] || port="$(next_free_port)"
+    if [[ -n "$port" ]]; then
+        # Unchecked, a typo here is written to the config, passes validation as
+        # a string, and only surfaces at bring-up in a different tool.
+        [[ "$port" =~ ^[0-9]+$ && "$port" -ge 1024 && "$port" -le 65535 ]] \
+            || die "--port must be a number between 1024 and 65535, got '${port}'"
+    else
+        port="$(next_free_port)"
+    fi
 
     if [[ -n "$conffile" ]]; then
         [[ -r "$conffile" ]] || die "cannot read ${conffile}"
@@ -215,10 +222,20 @@ cmd_remove() {
     done
     [[ -z "$users" ]] || die "still in use by:${users} — repoint those first (gw-egress set <channel> <other>)"
 
-    local dev; dev="$(eg_iface "$name")"
-    if ip link show "$dev" &>/dev/null; then
-        if [[ -f "/etc/amnezia/amneziawg/${dev}.conf" ]]; then awg-quick down "$dev" || true; else wg-quick down "$dev" || true; fi
+    local dev conf unit down
+    dev="$(eg_iface "$name")"
+    if [[ -f "/etc/amnezia/amneziawg/${dev}.conf" ]]; then
+        conf="/etc/amnezia/amneziawg/${dev}.conf"; unit="awg-quick@${dev}"; down="awg-quick"
+    else
+        conf="/etc/wireguard/${dev}.conf"; unit="wg-quick@${dev}"; down="wg-quick"
     fi
+    # The installer enabled this unit. Left enabled, the tunnel comes back on the
+    # next boot with no routing, no NAT and nothing here able to see it.
+    systemctl disable --now "$unit" >/dev/null 2>&1 || true
+    if ip link show "$dev" &>/dev/null; then $down down "$dev" || true; fi
+    # And the rendered config holds this gateway's private key for a peer it is
+    # no longer supposed to talk to.
+    rm -f "$conf"
     sed -i "/^EGRESS_${name}_/d" "$CONF_FILE"
     local rest=""
     for e in $EGRESS_PATHS; do [[ "$e" == "$name" ]] || rest="${rest} ${e}"; done

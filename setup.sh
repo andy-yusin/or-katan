@@ -57,9 +57,16 @@ done
 # Every question has a default. In --defaults mode the default is simply taken,
 # which is what makes the wizard usable from a script and testable.
 
+# Answers cannot be piped in: every question would take its default while the
+# piped text went unread, and the config that came out would look close enough
+# to what was asked for to pass unnoticed. Say so instead.
+[[ "$DEFAULTS" == yes || -t 0 ]] || die "stdin is not a terminal, so there is nobody to ask.
+    Re-run with --defaults to take every default, and pass the answers as options:
+    --host <name> --profile <name> --channels \"a b\" --egress \"name,endpoint,pubkey,address\""
+
 ask() {   # <prompt> <default> -> stdout
     local q="$1" d="${2:-}" a=""
-    if [[ "$DEFAULTS" == yes || ! -t 0 ]]; then printf '%s\n' "$d"; return 0; fi
+    if [[ "$DEFAULTS" == yes ]]; then printf '%s\n' "$d"; return 0; fi
     if [[ -n "$d" ]]; then printf '    %s [%s]: ' "$q" "$d" >&2; else printf '    %s: ' "$q" >&2; fi
     read -r a || true
     printf '%s\n' "${a:-$d}"
@@ -158,9 +165,25 @@ EGRESS_${name}_PORT=\"${eg_port}\"")
         proto="$(ask_one "  protocol (wg/awg)" "wg" wg awg)"
         endpoint="$(ask "  exit endpoint host:port" "")"
         pubkey="$(ask "  exit server public key" "")"
-        privkey="$(ask "  this gateway's private key on that peer" "")"
+        privkey="$(ask "  this gateway's private key on that peer (blank: generate one)" "")"
         psk="$(ask "  preshared key, if the exit uses one" "")"
         addr="$(ask "  this gateway's address inside that tunnel" "10.0.0.2/24")"
+        # Nobody standing up their first exit has a private key yet — that is
+        # why `gw-egress add` makes one. Leaving the field empty here only gets
+        # the config rejected by the installer two steps later.
+        if [[ -z "$privkey" ]]; then
+            local keytool="wg"; [[ "$proto" == "awg" ]] && keytool="awg"
+            if command -v "$keytool" >/dev/null; then
+                privkey="$($keytool genkey)"
+                note "generated a key pair — add this peer on the '${name}' exit:"
+                printf '      [Peer]\n      PublicKey = %s\n      AllowedIPs = %s/32\n\n' \
+                    "$(printf '%s' "$privkey" | "$keytool" pubkey)" "${addr%%/*}"
+            else
+                warn "no '${keytool}' on PATH yet, so no key could be generated"
+                note "run '${keytool} genkey' after installing and put it in EGRESS_${name}_PRIVKEY,"
+                note "or declare this exit later with: gw-egress add ${name} --endpoint ... --pubkey ... --address ..."
+            fi
+        fi
         EG_BLOCKS+=("EGRESS_${name}_TYPE=\"tunnel\"
 EGRESS_${name}_PROTO=\"${proto}\"
 EGRESS_${name}_ENDPOINT=\"${endpoint}\"
@@ -285,8 +308,12 @@ step "Write"
     echo "INGRESS_CHANNELS=\"${CHANNELS}\""
     for b in "${CH_BLOCKS[@]}"; do echo; echo "$b"; done
     echo
+    # Delimited so `gw-config profile` can replace the whole block later —
+    # parked rules and their instructions included, which would otherwise
+    # outlive the profile that wrote them.
+    echo "# --- policy: begin (managed by gw-config profile) ---"
     if [[ -n "$PROFILE" && -r "$PROF_FILE" ]]; then
-        echo "# --- policy from profile '${PROFILE}' ---"
+        echo "# From profile '${PROFILE}'."
         # Any rule whose egress was never declared is parked: commented out and
         # dropped from POLICY_RULES, so the config installs and the rule is one
         # uncomment away once the exit exists.
@@ -311,6 +338,7 @@ step "Write"
     else
         echo "POLICY_RULES=\"\""
     fi
+    echo "# --- policy: end ---"
     echo
     echo "DNS_STACK=\"yes\""
     echo "DNS_FILTER_ENABLE=\"${DNS_FILTER}\""

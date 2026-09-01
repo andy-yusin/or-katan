@@ -12,9 +12,14 @@
 #   gw-config profiles                 list the available policy profiles
 #   gw-config profile <name>           apply one  (--dry-run to preview)
 #
-# Every mutating command validates before it writes and applies after, so the
-# running gateway and the file on disk do not drift apart. --no-apply writes
-# the change and stops, for when you want to batch several.
+# Every mutating command validates before it writes and applies after, and rolls
+# the file back if either is refused, so the running gateway and the file on disk
+# do not drift apart. --no-apply writes the change and stops, for when you want
+# to batch several; give it before the command or as the last argument, so it is
+# never mistaken for a value:
+#
+#   gw-config --no-apply set <key> <value>
+#   gw-config set <key> <value> --no-apply
 #
 set -euo pipefail
 
@@ -30,14 +35,24 @@ warn() { echo "  ${YELLOW}!${NC} $*"; }
 
 [[ -r "$CONF_FILE" ]] || die "config not readable: $CONF_FILE"
 
+LIB="/etc/gateway/gw-lib.sh"
+[[ -r "$LIB" ]] || LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gw-lib.sh"
+[[ -r "$LIB" ]] || die "gw-lib.sh not found (expected /etc/gateway/gw-lib.sh) — re-run install.sh"
+# shellcheck source=files/gw-lib.sh
+# shellcheck disable=SC1090
+source "$LIB"
+
+# --no-apply is an option, not a value. It is honoured where an option can
+# appear — ahead of the subcommand, or as the final argument — and never
+# plucked out of the middle, where it would silently swallow someone's value.
 APPLY=yes
-args=()
-for a in "$@"; do
-    case "$a" in
-        --no-apply) APPLY=no ;;
-        *) args+=("$a") ;;
-    esac
+args=("$@")
+while [[ ${#args[@]} -gt 0 && "${args[0]}" == "--no-apply" ]]; do
+    APPLY=no; args=("${args[@]:1}")
 done
+if [[ ${#args[@]} -gt 0 && "${args[${#args[@]}-1]}" == "--no-apply" ]]; then
+    APPLY=no; args=("${args[@]:0:${#args[@]}-1}")
+fi
 set -- ${args[0]+"${args[@]}"}
 
 # --- helpers -----------------------------------------------------------------
@@ -52,22 +67,7 @@ conf_get() {
     printf '%s\n' "$line"
 }
 
-conf_set() {
-    local k="$1" v="$2"
-    if grep -qE "^${k}=" "$CONF_FILE"; then
-        # A key can legitimately appear commented out above its real line; only
-        # the uncommented one is rewritten.
-        sed -i "s|^${k}=.*|${k}=\"${v}\"|" "$CONF_FILE"
-    else
-        printf '%s="%s"\n' "$k" "$v" >> "$CONF_FILE"
-    fi
-}
-
-conf_unset() {
-    local k="$1"
-    grep -qE "^${k}=" "$CONF_FILE" || return 0
-    sed -i "/^${k}=/d" "$CONF_FILE"
-}
+# conf_set and conf_unset come from gw-lib.sh, shared with gw-egress.
 
 # Two shapes: plain settings like GATEWAY_HOST, and the per-object keys whose
 # middle segment is a channel, egress or rule name and is therefore lowercase.
@@ -85,26 +85,44 @@ validate() {
     "$INSTALLER" --check-only
 }
 
+# The pre-change copy, kept alive from with_rollback through apply(): a value
+# that validated but that the gateway then refused must not be left on disk
+# describing a state the gateway never reached.
+ROLLBACK=""
+
+rollback() {   # <message> — restore the config, then abort
+    if [[ -n "$ROLLBACK" ]]; then cp "$ROLLBACK" "$CONF_FILE"; rm -f "$ROLLBACK"; ROLLBACK=""; fi
+    die "$1"
+}
+
+commit() { [[ -z "$ROLLBACK" ]] || rm -f "$ROLLBACK"; ROLLBACK=""; }
+
 apply() {
-    [[ "$APPLY" == yes ]] || { info "not applied (--no-apply); run 'gw-config apply' when ready"; return 0; }
+    [[ "$APPLY" == yes ]] || { commit; info "not applied (--no-apply); run 'gw-config apply' when ready"; return 0; }
     [[ -x "$INSTALLER" ]] || die "installer not found at ${INSTALLER} — cannot apply"
     echo
-    "$INSTALLER"
+    if ! "$INSTALLER"; then
+        rollback "the gateway refused the change — config rolled back. The running state may be half-applied: fix the cause above, then re-run 'gw-config apply'."
+    fi
+    commit
 }
 
 # Roll the file back if validation fails, so a bad value never survives.
 with_rollback() {
-    local backup; backup="$(mktemp)"
-    cp "$CONF_FILE" "$backup"
-    if ! "$@"; then cp "$backup" "$CONF_FILE"; rm -f "$backup"; die "no changes made"; fi
-    if ! validate; then
-        cp "$backup" "$CONF_FILE"; rm -f "$backup"
-        die "the change did not validate — config rolled back, nothing applied"
-    fi
-    rm -f "$backup"
+    ROLLBACK="$(mktemp)"
+    cp "$CONF_FILE" "$ROLLBACK"
+    if ! "$@"; then rollback "no changes made"; fi
+    if ! validate; then rollback "the change did not validate — config rolled back, nothing applied"; fi
 }
 
 # --- profiles ----------------------------------------------------------------
+
+# The policy block is delimited so it can be replaced whole. setup.sh writes the
+# same markers, so a config the wizard wrote is replaceable too.
+BEGIN_MARK="# --- policy: begin (managed by gw-config profile) ---"
+END_MARK="# --- policy: end ---"
+BEGIN_MARK_RE="# --- policy: begin"
+END_MARK_RE="# --- policy: end"
 
 profile_meta() {   # <file> <key>
     grep -E "^# ${2}:" "$1" 2>/dev/null | sed -E "s|^# ${2}:[[:space:]]*||" || true
@@ -153,13 +171,26 @@ apply_profile() {
         return 0
     fi
 
-    # Strip every existing POLICY_ line, then append the profile's block. The
+    # Strip the whole previous policy block, then append this profile's. The
     # rest of the file — channels, egress paths, DNS, everything — is untouched.
-    sed -i '/^POLICY_/d' "$CONF_FILE"
+    #
+    # "Whole" means the marked block and the loose forms that predate the
+    # markers: parked '#POLICY_' rules and the notes telling someone to
+    # uncomment them. Left behind, they invite an operator to reinstate rules
+    # belonging to a profile that is no longer applied.
+    sed -i -e "/^${BEGIN_MARK_RE}/,/^${END_MARK_RE}/d" \
+           -e '/^#\{0,1\}POLICY_/d' \
+           -e "/^# --- policy from profile /d" \
+           -e "/^# The rule(s).* are commented out: /d" \
+           -e "/^# does not exist yet\. Declare it with /d" \
+           -e "/^# add the rule name back to POLICY_RULES, /d" \
+           "$CONF_FILE"
     {
         echo
-        echo "# --- policy from profile '${name}' — replaced wholesale by gw-config profile ---"
+        echo "$BEGIN_MARK"
+        echo "# From profile '${name}' — replaced wholesale by gw-config profile."
         echo "$body" | sed '/^$/N;/^\n$/D'
+        echo "$END_MARK"
     } >> "$CONF_FILE"
     conf_set GATEWAY_PROFILE "$name"
     ok "applied profile '${name}'"
@@ -261,6 +292,6 @@ case "$cmd" in
               with_rollback apply_profile "$2"
               apply ;;
 
-    -h|--help) sed -n '2,20p' "$0" | sed 's/^#//;s/^ //' ;;
+    -h|--help) sed -n '2,23p' "$0" | sed 's/^#//;s/^ //' ;;
     *) die "unknown command: ${cmd}   (gw-config --help)" ;;
 esac

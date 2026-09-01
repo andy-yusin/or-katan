@@ -1,14 +1,70 @@
 #!/bin/bash
 # Test shim: no systemd in a container, so translate unit actions into the
 # real commands the units would run.
+#
+# stop, disable and --now are implemented for real, and enablement is tracked in
+# a file so is-enabled answers truthfully. A shim that quietly succeeds at
+# stopping things cannot see a unit left running or left enabled, which is
+# exactly the kind of teardown bug worth catching here.
+STATE=/run/shim-enabled-units
+touch "$STATE" 2>/dev/null || STATE=/tmp/shim-enabled-units
+touch "$STATE" 2>/dev/null || true
+
 cmd="${1:-}"; shift || true
-args=("$@")
-unit="${args[0]:-}"
-unit="${unit%.service}"
+NOW=no
+args=()
+for a in "$@"; do
+  case "$a" in
+    --now) NOW=yes ;;
+    --quiet|-q|--plain|--no-legend|--no-pager|--value) ;;
+    *) args+=("$a") ;;
+  esac
+done
+unit="${args[0]:-}"; unit="${unit%.service}"
+
+unit_stop() {
+  case "$1" in
+    wg-quick@*)  wg-quick  down "${1#wg-quick@}"  &>/dev/null || true ;;
+    awg-quick@*) awg-quick down "${1#awg-quick@}" &>/dev/null || true ;;
+    dnsmasq|dnscrypt-proxy|AdGuardHome) pkill -x "$1" >/dev/null 2>&1 || true; sleep 0.5 ;;
+  esac
+  return 0
+}
+
+unit_start() {
+  case "$1" in
+    wg-quick@*)  wg-quick  down "${1#wg-quick@}"  &>/dev/null; wg-quick  up "${1#wg-quick@}" ;;
+    awg-quick@*) awg-quick down "${1#awg-quick@}" &>/dev/null; awg-quick up "${1#awg-quick@}" ;;
+    dnsmasq)        pkill -x dnsmasq; sleep 0.3; dnsmasq --conf-file=/etc/dnsmasq.conf ;;
+    dnscrypt-proxy) pkill -x dnscrypt-proxy; sleep 0.3
+                    setsid dnscrypt-proxy -config /etc/dnscrypt-proxy/dnscrypt-proxy.toml >/var/log/dnscrypt.log 2>&1 &
+                    sleep 3 ;;
+    AdGuardHome)    pkill -x AdGuardHome; sleep 0.3
+                    setsid /opt/AdGuardHome/AdGuardHome -s run --no-check-update -w /opt/AdGuardHome >/var/log/agh.log 2>&1 &
+                    sleep 4 ;;
+    *) return 0 ;;
+  esac
+}
+
 case "$cmd" in
-  daemon-reload|enable|disable|mask|unmask|reload|reload-or-restart) exit 0 ;;
+  daemon-reload|mask|unmask|reload|reload-or-restart) exit 0 ;;
+
+  enable)
+    grep -qxF "$unit" "$STATE" 2>/dev/null || echo "$unit" >> "$STATE"
+    [[ "$NOW" == yes ]] && unit_start "$unit"
+    exit 0 ;;
+
+  disable)
+    grep -vxF "$unit" "$STATE" > "${STATE}.new" 2>/dev/null
+    mv "${STATE}.new" "$STATE" 2>/dev/null || true
+    [[ "$NOW" == yes ]] && unit_stop "$unit"
+    exit 0 ;;
+
+  is-enabled) grep -qxF "$unit" "$STATE" 2>/dev/null && exit 0 || exit 1 ;;
+
+  stop) unit_stop "$unit"; exit 0 ;;
+
   is-active)
-    [[ "${args[0]}" == "--quiet" ]] && unit="${args[1]%.service}"
     case "$unit" in
       wg-quick@*)  ip link show "${unit#wg-quick@}"  &>/dev/null && exit 0 || exit 3 ;;
       awg-quick@*) ip link show "${unit#awg-quick@}" &>/dev/null && exit 0 || exit 3 ;;
@@ -17,18 +73,8 @@ case "$cmd" in
       AdGuardHome)      pgrep -x AdGuardHome    >/dev/null && exit 0 || exit 3 ;;
       *) exit 3 ;;
     esac ;;
-  start|restart)
-    case "$unit" in
-      wg-quick@*)  wg-quick  down "${unit#wg-quick@}"  &>/dev/null; wg-quick  up "${unit#wg-quick@}" ;;
-      awg-quick@*) awg-quick down "${unit#awg-quick@}" &>/dev/null; awg-quick up "${unit#awg-quick@}" ;;
-      dnsmasq)        pkill -x dnsmasq; sleep 0.3; dnsmasq --conf-file=/etc/dnsmasq.conf ;;
-      dnscrypt-proxy) pkill -x dnscrypt-proxy; sleep 0.3
-                      setsid dnscrypt-proxy -config /etc/dnscrypt-proxy/dnscrypt-proxy.toml >/var/log/dnscrypt.log 2>&1 &
-                      sleep 3 ;;
-      AdGuardHome)    pkill -x AdGuardHome; sleep 0.3
-                      setsid /opt/AdGuardHome/AdGuardHome -s run --no-check-update -w /opt/AdGuardHome >/var/log/agh.log 2>&1 &
-                      sleep 4 ;;
-      *) exit 0 ;;
-    esac ;;
+
+  start|restart) unit_start "$unit" ;;
+
   *) exit 0 ;;
 esac

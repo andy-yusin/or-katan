@@ -18,7 +18,7 @@ jobs:
           shellcheck -S warning \
             install.sh uninstall.sh setup.sh \
             files/gw-routes.sh files/gw-client files/gw-egress \
-            files/gw-config files/gw-doctor \
+            files/gw-config files/gw-doctor files/gw-lib.sh \
             test/run.sh test/shims/systemctl test/shims/awg test/shims/awg-quick
 
   install:

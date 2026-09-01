@@ -64,6 +64,7 @@ because the next install regenerates it.
 | `files/gw-egress` | Inspect, switch, add and remove egress paths. |
 | `files/gw-config` | Read/write config keys, apply profiles, validate, apply. |
 | `files/gw-doctor` | Layered health check. Start here when debugging. |
+| `files/gw-lib.sh` | The config writer, sourced by `gw-config` and `gw-egress`. Sourced, never run. Anything that writes `gateway.conf` belongs here, not in a second copy. |
 | `profiles/*.profile` | Ready-made destination policies. Format documented in `profiles/README.md`. |
 | `templates/*.tmpl` | Rendered by `install.sh` with `@PLACEHOLDER@` substitution. |
 | `test/run.sh` | Installs the whole stack in a container and checks it. |
@@ -100,6 +101,18 @@ can be re-applied without the clone it came from.
    an `ip rule` at priority 100; policy marks select a table at priority 50;
    inter-channel traffic is priority 10. Table `gw_local` is 199.
 
+7. **An interface is restarted only when its own config actually changed.**
+   `install.sh` snapshots each rendered config, compares, and restarts only
+   what moved; an unchanged channel gets `gw-routes.sh up` instead, which
+   re-stages routing without costing anyone their connection. Every
+   `gw-config set` runs the whole installer, so restarting unconditionally
+   means every settings change disconnects everyone.
+
+8. **The installed config wins over the one in the clone.** `gw-config`,
+   `gw-egress` and profiles all write `/etc/gateway/gateway.conf`. Preflight
+   takes whichever of the two was edited last, so `git pull && ./install.sh`
+   cannot silently revert work done with the tools.
+
 ## Naming
 
 Interfaces are `in-<channel>` and `out-<egress>`. Routing tables are
@@ -120,6 +133,11 @@ is why channel and egress names must match `^[a-z][a-z0-9_]*$`.
   `|| echo 0`.
 - **WireGuard public keys are base64** and contain `+`, `/`, `=`. Never use one
   as a regex; compare as a string.
+- **`sed` replacement text is not literal.** `&` expands to the whole match and
+  the delimiter ends the expression, so a value containing either corrupts the
+  line — silently, in a way that still validates. Config writes go through
+  `conf_set` in `files/gw-lib.sh`, which escapes them; do not hand-roll another
+  `sed -i "s|^KEY=.*|KEY=$value|"`.
 - **`systemd-networkd` restarts flush foreign policy rules.** Guarded by a
   drop-in the installer writes; if rules vanish after an apt upgrade, that is
   why. Recovery is `gw-routes.sh up <channel>`.
