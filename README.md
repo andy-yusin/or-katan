@@ -85,8 +85,8 @@ see what your clients look up.
 ## Install
 
 ```bash
-git clone https://github.com/OWNER/REPO.git
-cd REPO
+git clone https://github.com/andy-yusin/or-katan.git
+cd or-katan
 cp gateway.conf.example gateway.conf
 $EDITOR gateway.conf          # declare your channels and egress paths
 sudo ./install.sh
