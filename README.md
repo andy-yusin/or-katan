@@ -47,8 +47,8 @@ Example — three groups, three ways out:
 | `friends` | AmneziaWG | yes — internet only | `main` |
 | `work` | WireGuard | no | `backup` |
 
-plus a rule sending `kinopoisk.ru`, `rutube.ru` out a `video` path and `.ru`
-domains out `direct`, regardless of which channel asked.
+plus a rule sending `bbc.co.uk` out a `uk` path and your bank out `direct`,
+regardless of which channel asked.
 
 ## Two ingress protocols, on purpose
 

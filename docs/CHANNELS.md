@@ -54,7 +54,7 @@ both sides, so name it on the channel that initiates.
 ## Egress paths
 
 ```ini
-EGRESS_PATHS="main backup video direct"
+EGRESS_PATHS="main backup uk direct"
 ```
 
 Order matters only in that the first entry is the default for any channel that
@@ -64,22 +64,22 @@ even if you do not declare it.
 A tunnel egress needs an exit server; see [EXIT-SERVER.md](EXIT-SERVER.md).
 
 ```ini
-EGRESS_video_TYPE="tunnel"
-EGRESS_video_PROTO="wg"                 # wg | awg
-EGRESS_video_ENDPOINT="198.51.100.7:51820"
-EGRESS_video_PUBKEY="<exit server's public key>"
-EGRESS_video_PRIVKEY="<this gateway's private key on that peer>"
-EGRESS_video_ADDRESS="10.2.0.2/24"
-EGRESS_video_PORT="51902"               # unique local listen port
+EGRESS_uk_TYPE="tunnel"
+EGRESS_uk_PROTO="wg"                 # wg | awg
+EGRESS_uk_ENDPOINT="198.51.100.7:51820"
+EGRESS_uk_PUBKEY="<exit server's public key>"
+EGRESS_uk_PRIVKEY="<this gateway's private key on that peer>"
+EGRESS_uk_ADDRESS="10.2.0.2/24"
+EGRESS_uk_PORT="51902"               # unique local listen port
 ```
 
 If a provider hands you a ready-made config file instead of separate values,
 point at it and skip the individual fields:
 
 ```ini
-EGRESS_video_TYPE="tunnel"
-EGRESS_video_CONF_FILE="/root/provider-nl.conf"
-EGRESS_video_PORT="51902"
+EGRESS_uk_TYPE="tunnel"
+EGRESS_uk_CONF_FILE="/root/provider-uk.conf"
+EGRESS_uk_PORT="51902"
 ```
 
 The installer copies it and enforces the two things that must hold here:
@@ -94,56 +94,66 @@ Policy overrides the channel default for specific destinations, for **all**
 channels:
 
 ```ini
-POLICY_RULES="local video"
+POLICY_RULES="home stream"
 
-POLICY_local_EGRESS="direct"
-POLICY_local_DOMAINS="ru su xn--p1ai yandex.com vk.com"
-POLICY_local_CIDRS="5.136.0.0/13"
-POLICY_local_DNS="77.88.8.8"
+POLICY_home_EGRESS="direct"
+POLICY_home_DOMAINS="bank.example tax.gov.example intranet.work.example"
+POLICY_home_CIDRS=""
+POLICY_home_DNS="192.168.1.1"
 
-POLICY_video_EGRESS="video"
-POLICY_video_DOMAINS="kinopoisk.ru rutube.ru"
+POLICY_stream_EGRESS="uk"
+POLICY_stream_DOMAINS="bbc.co.uk bbci.co.uk"
 ```
 
-`DOMAINS` are matched as suffixes, so `ru` covers every `.ru` name and
-`kinopoisk.ru` covers its subdomains. As each name resolves, dnsmasq puts the
-answer in that rule's ipset and the routing follows — no CIDR maintenance, and
-CDNs are covered.
+`DOMAINS` are matched as suffixes, so `bbc.co.uk` covers its subdomains and a
+bare TLD like `uk` would cover every name under it. As each name resolves,
+dnsmasq puts the answer in that rule's ipset and the routing follows — no CIDR
+maintenance, and CDNs are covered.
+
+`POLICY_home_DNS` gives that rule its own resolver, pinned to the uplink. Your
+router knows your local names, returns better-located answers for anything that
+picks a nearby server, and keeps answering while a tunnel egress is down.
 
 ### When domains are not enough
 
 `CIDRS` covers destinations that domain matching structurally cannot catch.
-The case that forces it: a service whose player pulls video segments from a
-shared anti-DDoS CDN, on addresses not reachable under the service's own
-hostname. dnsmasq never sees those names resolved, so nothing lands in the
+The case that forces it: a service whose player pulls media from a shared CDN
+or anti-DDoS front-end, on addresses that never appear under a hostname your
+rule matched. dnsmasq never sees those names resolved, so nothing lands in the
 ipset, and the segments take a different egress than the page did.
 
 The symptom is specific and confusing — **the site loads but will not play**.
 Everything you can see in a browser works; only the media stalls.
 
-RuTube is the standard example. Its video rides AS51115 (Qrator) and AS201706
-(Servicepipe):
+The fix is to pin the ranges those addresses belong to:
 
 ```ini
-POLICY_video_EGRESS="video"
-POLICY_video_DOMAINS="kinopoisk.ru kp.yandex.net rutube.ru strm.yandex.ru strm.yandex.net vh.yandex.ru vh.yandex.net"
-POLICY_video_CIDRS="178.248.233.0/24 178.248.234.0/24 178.248.239.0/24 81.161.99.0/24 109.238.90.0/24"
+POLICY_stream_EGRESS="uk"
+POLICY_stream_DOMAINS="bbc.co.uk bbci.co.uk"
+POLICY_stream_CIDRS="203.0.113.0/24 198.51.100.0/24"
 ```
 
-Seeds are static and therefore age. Treat them as a supplement to domain
-matching, never a replacement. To refresh them:
-
-```bash
-whois -h whois.radb.net -- '-i origin AS51115' | grep ^route
-```
-
-To find what a stubborn service actually pulls from, watch what is *not*
-landing in the set while you use it:
+Those two are documentation ranges standing in for the real ones. To find what
+a stubborn service actually pulls from, watch what is *not* landing in the set
+while you use it:
 
 ```bash
 tcpdump -ni in-family 'tcp port 443' \
-  | grep -vf <(ipset list gwpd_video | grep '^[0-9]')
+  | grep -vf <(ipset list gwpd_stream | grep '^[0-9]')
 ```
+
+Then look up who owns an address you caught, and pin the range rather than the
+address — CDN nodes move within an allocation, the allocation itself rarely
+changes:
+
+```bash
+whois -h whois.radb.net 203.0.113.7 | grep -iE '^route|^origin'
+whois -h whois.radb.net -- '-i origin AS64496' | grep ^route
+```
+
+Seeds are static and therefore age. Treat them as a supplement to domain
+matching, never a replacement, and re-check them if a service starts
+misbehaving.
 
 The two sets are separate on purpose: `gwp_<rule>` holds your static seeds and
 persists, `gwpd_<rule>` is filled by dnsmasq and entries expire. Both feed the
@@ -160,11 +170,11 @@ Rules are applied in the order listed and **the last match wins**. To carve an
 exception out of a broad rule, put the narrow one after it:
 
 ```ini
-POLICY_RULES="local exception"
-POLICY_local_EGRESS="direct"
-POLICY_local_DOMAINS="ru su"
+POLICY_RULES="home exception"
+POLICY_home_EGRESS="direct"
+POLICY_home_DOMAINS="work.example"
 POLICY_exception_EGRESS="main"
-POLICY_exception_DOMAINS="somesite.ru"      # .ru, but hosted abroad
+POLICY_exception_DOMAINS="vpn.work.example"   # under it, but wanted via main
 ```
 
 Verify an exception took effect:
@@ -176,11 +186,12 @@ ip route get <ip> from 10.30.10.2 iif in-family mark 0
 
 ## A worked example
 
-A household gateway in a country that filters, with an exit abroad:
+A household gateway with an exit abroad, a second exit for one geo-locked
+service, and three groups of devices that should not be equals:
 
 ```ini
-EGRESS_PATHS="main video direct"
-# main  -> a VPS abroad; video -> a host in the streaming service's country
+EGRESS_PATHS="main uk direct"
+# main -> a VPS abroad; uk -> a host in the country one service insists on
 
 INGRESS_CHANNELS="family friends iot"
 
@@ -193,17 +204,17 @@ INGRESS_friends_TYPE="awg"; INGRESS_friends_EGRESS="main"; INGRESS_friends_ISOLA
 # devices you do not trust: plain wg, isolated, straight out
 INGRESS_iot_TYPE="wg"; INGRESS_iot_EGRESS="direct"; INGRESS_iot_ISOLATE="yes"
 
-POLICY_RULES="local video"
+POLICY_RULES="home stream"
 
-# national services stay fast and never see a foreign address
-POLICY_local_EGRESS="direct"
-POLICY_local_DOMAINS="ru su xn--p1ai yandex.com vk.com"
-POLICY_local_DNS="77.88.8.8"
+# the bank should see your own address, and the router answers for local names
+POLICY_home_EGRESS="direct"
+POLICY_home_DOMAINS="bank.example tax.gov.example intranet.work.example"
+POLICY_home_DNS="192.168.1.1"
 
-# video listed second, so it overrides "local" for these .ru names
-POLICY_video_EGRESS="video"
-POLICY_video_DOMAINS="kinopoisk.ru rutube.ru vh.yandex.ru strm.yandex.ru"
-POLICY_video_CIDRS="178.248.233.0/24 178.248.234.0/24 178.248.239.0/24 81.161.99.0/24 109.238.90.0/24"
+# stream is listed second, so it wins wherever both rules match
+POLICY_stream_EGRESS="uk"
+POLICY_stream_DOMAINS="bbc.co.uk bbci.co.uk"
+POLICY_stream_CIDRS="203.0.113.0/24 198.51.100.0/24"
 ```
 
 Everyone gets filtered DNS. Nobody on `friends` can see anything. The IoT

@@ -7,7 +7,7 @@ broke something without pointing a real box at it.
 ```bash
 test/run.sh                       # the shipped example config (single-hop)
 test/run.sh multi-channel         # 3 channels, 3 egress paths, isolation
-test/run.sh video-policy          # per-destination egress with ipset seeds
+test/run.sh policy-seeds          # per-destination egress with ipset seeds
 test/run.sh multi-channel --shell # same, then drop into a shell to poke around
 ```
 

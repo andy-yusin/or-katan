@@ -3,7 +3,7 @@
 #
 #   test/run.sh                       # the shipped example config (single-hop)
 #   test/run.sh multi-channel         # 3 channels, 3 egress paths, isolation
-#   test/run.sh video-policy          # per-destination egress with ipset seeds
+#   test/run.sh policy-seeds          # per-destination egress with ipset seeds
 #   test/run.sh multi-channel --shell # same, but drop into a shell at the end
 #
 # Two things a container cannot give us, and what we do instead:

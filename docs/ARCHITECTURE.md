@@ -61,18 +61,18 @@ nothing.
 A rule is a set of domains, a set of CIDRs, and the egress they should take:
 
 ```ini
-POLICY_RULES="local video"
-POLICY_local_EGRESS="direct"
-POLICY_local_DOMAINS="ru su xn--p1ai yandex.com"
-POLICY_video_EGRESS="video"
-POLICY_video_DOMAINS="kinopoisk.ru rutube.ru"
+POLICY_RULES="home stream"
+POLICY_home_EGRESS="direct"
+POLICY_home_DOMAINS="bank.example tax.gov.example"
+POLICY_stream_EGRESS="uk"
+POLICY_stream_DOMAINS="bbc.co.uk bbci.co.uk"
 ```
 
 Each rule gets two ipsets: `gwp_<rule>` for the static CIDRs, and
 `gwpd_<rule>` which dnsmasq fills as names resolve:
 
 ```
-ipset=/ru/su/yandex.com/gwpd_local
+ipset=/bank.example/tax.gov.example/gwpd_home
 ```
 
 The marking rules live in `mangle PREROUTING`, **appended in the order the

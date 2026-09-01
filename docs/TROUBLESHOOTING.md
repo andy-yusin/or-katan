@@ -161,16 +161,16 @@ rule but hosted somewhere the rule did not intend. Add a narrower rule *after*
 the broad one, since the last match wins:
 
 ```ini
-POLICY_RULES="local exception"
+POLICY_RULES="home exception"
 POLICY_exception_EGRESS="main"
-POLICY_exception_DOMAINS="somesite.ru"
+POLICY_exception_DOMAINS="vpn.work.example"
 ```
 
 Re-run `./install.sh`, then seed the current address so it takes effect before
 the next lookup:
 
 ```bash
-ipset add gwpd_exception "$(dig +short somesite.ru @127.0.0.1 -p 5353 | head -1)"
+ipset add gwpd_exception "$(dig +short vpn.work.example @127.0.0.1 -p 5353 | head -1)"
 ip route get <ip> from 10.30.10.2 iif in-family mark 0     # expect the tunnel
 ```
 
