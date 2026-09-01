@@ -28,7 +28,6 @@ set -euo pipefail
 
 CONF_FILE="${GATEWAY_CONF:-/etc/gateway/gateway.conf}"
 ROUTES="/etc/gateway/gw-routes.sh"
-MARK_MASK="0xff"
 
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; CYAN=$'\033[0;36m'; BOLD=$'\033[1m'; NC=$'\033[0m'
 die() { echo "${RED}ERROR:${NC} $*" >&2; exit 1; }
