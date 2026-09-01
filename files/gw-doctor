@@ -1,0 +1,254 @@
+#!/bin/bash
+#
+# gw-doctor — check every layer of the gateway and say what is wrong.
+#
+# Run after install, after a reboot, and whenever something feels off.
+# Exit status is 1 if anything failed.
+#
+set -uo pipefail
+
+CONF_FILE="${GATEWAY_CONF:-/etc/gateway/gateway.conf}"
+RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; CYAN=$'\033[0;36m'; NC=$'\033[0m'
+
+PASSC=0; WARNC=0; FAILC=0
+pass() { printf '  %sPASS%s  %s\n' "$GREEN" "$NC" "$1"; PASSC=$((PASSC+1)); }
+warn() { printf '  %sWARN%s  %s\n' "$YELLOW" "$NC" "$1"; [[ -n "${2:-}" ]] && printf '        %s\n' "$2"; WARNC=$((WARNC+1)); }
+fail() { printf '  %sFAIL%s  %s\n' "$RED" "$NC" "$1"; [[ -n "${2:-}" ]] && printf '        %s\n' "$2"; FAILC=$((FAILC+1)); }
+section() { printf '\n%s== %s ==%s\n' "$CYAN" "$1" "$NC"; }
+
+[[ $EUID -eq 0 ]] || { echo "must run as root" >&2; exit 1; }
+[[ -r "$CONF_FILE" ]] || { echo "config not readable: $CONF_FILE" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "$CONF_FILE"
+: "${INGRESS_CHANNELS:=}"; : "${EGRESS_PATHS:=direct}"; : "${POLICY_RULES:=}"
+: "${DNS_STACK:=yes}"; : "${DNS_FILTER_ENABLE:=yes}"; : "${GATEWAY_HOST:=}"
+: "${DNS_EGRESS:=}"
+
+DEF_IF="$(ip route show default | awk '/default/ {print $5; exit}')"
+cfg() { local v="$1"; echo "${!v-}"; }
+eg_type() { local t; t="$(cfg "EGRESS_${1}_TYPE")"; [[ -n "$t" ]] || { [[ "$1" == "direct" ]] && t="direct" || t=""; }; echo "$t"; }
+eg_iface(){ [[ "$(eg_type "$1")" == "direct" ]] && echo "$DEF_IF" || echo "out-$1"; }
+eg_table(){ echo "gw_$1"; }
+ch_type() { local t; t="$(cfg "INGRESS_${1}_TYPE")"; echo "${t:-wg}"; }
+ch_net()  { cfg "INGRESS_${1}_NET"; }
+ch_port() { cfg "INGRESS_${1}_PORT"; }
+ch_iface(){ echo "in-$1"; }
+ch_egress(){ local e; e="$(cfg "INGRESS_${1}_EGRESS")"; [[ -n "$e" ]] || e="$(echo "$EGRESS_PATHS" | awk '{print $1}')"; echo "$e"; }
+ch_tool() { [[ "$(ch_type "$1")" == "awg" ]] && echo awg || echo wg; }
+net_gw()  { echo "${1%.0/24}.1"; }
+
+# ---------------------------------------------------------------------------
+section "configuration"
+[[ -n "$INGRESS_CHANNELS" ]] && pass "ingress channels: ${INGRESS_CHANNELS}" \
+                             || fail "no ingress channels declared — nobody can connect"
+pass "egress paths: ${EGRESS_PATHS}"
+for c in $INGRESS_CHANNELS; do
+    e="$(ch_egress "$c")"
+    [[ " ${EGRESS_PATHS} " == *" ${e} "* ]] \
+        && pass "channel '${c}' -> egress '${e}'" \
+        || fail "channel '${c}' points at undeclared egress '${e}'" "add it to EGRESS_PATHS or fix INGRESS_${c}_EGRESS"
+done
+for r in $POLICY_RULES; do
+    e="$(cfg "POLICY_${r}_EGRESS")"
+    [[ " ${EGRESS_PATHS} " == *" ${e} "* ]] \
+        && pass "policy '${r}' -> egress '${e}'" \
+        || fail "policy '${r}' names undeclared egress '${e}'"
+done
+
+# ---------------------------------------------------------------------------
+section "kernel"
+if [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]]; then
+    pass "IPv4 forwarding enabled"
+else
+    fail "IPv4 forwarding is OFF — nothing can be routed" "sysctl -w net.ipv4.ip_forward=1"
+fi
+
+# ---------------------------------------------------------------------------
+section "ingress channels"
+for c in $INGRESS_CHANNELS; do
+    iface="$(ch_iface "$c")"; tool="$(ch_tool "$c")"; net="$(ch_net "$c")"; port="$(ch_port "$c")"
+    if ! ip link show "$iface" &>/dev/null; then
+        unit="$([[ "$tool" == "awg" ]] && echo "awg-quick@${iface}" || echo "wg-quick@${iface}")"
+        fail "${c}: ${iface} is DOWN" "systemctl start ${unit} && journalctl -u ${unit} -n50"
+        continue
+    fi
+    listen="$($tool show "$iface" listen-port 2>/dev/null)"
+    [[ "$listen" == "$port" ]] && pass "${c}: up on UDP ${port}" \
+                               || fail "${c}: listening on '${listen}', config says ${port}"
+    addr="$(ip -4 -br addr show dev "$iface" | awk '{print $3}')"
+    [[ "$addr" == "$(net_gw "$net")/24" ]] && pass "${c}: address ${addr}" \
+                                           || fail "${c}: address is '${addr}', expected $(net_gw "$net")/24"
+    n="$($tool show "$iface" peers 2>/dev/null | wc -l | tr -d ' ')"
+    printf '        %s client(s)\n' "$n"
+done
+
+# ---------------------------------------------------------------------------
+section "egress paths"
+for e in $EGRESS_PATHS; do
+    dev="$(eg_iface "$e")"
+    if [[ "$(eg_type "$e")" == "direct" ]]; then
+        pass "${e}: direct via ${dev}"
+    elif ip link show "$dev" &>/dev/null; then
+        hs=""
+        for t in wg awg; do
+            command -v "$t" >/dev/null || continue
+            hs="$($t show "$dev" latest-handshakes 2>/dev/null | awk '{print $2}' | sort -rn | head -1)"
+            [[ -n "${hs:-}" ]] && break
+        done
+        if [[ -n "${hs:-}" && "$hs" != "0" ]]; then
+            age=$(( $(date +%s) - hs ))
+            [[ $age -lt 300 ]] && pass "${e}: up, handshake ${age}s ago" \
+                               || fail "${e}: last handshake ${age}s ago — the exit is not answering" \
+                                       "channels using it are failing closed. gw-egress set <channel> direct"
+        else
+            fail "${e}: never completed a handshake" "check EGRESS_${e}_ENDPOINT and the keys"
+        fi
+    else
+        fail "${e}: ${dev} is DOWN — channels using it are failing closed" \
+             "wg-quick up ${dev}   (or: gw-egress set <channel> direct)"
+    fi
+    if ip route show table "$(eg_table "$e")" 2>/dev/null | grep -q default; then
+        pass "${e}: table $(eg_table "$e") has a default route"
+    else
+        fail "${e}: table $(eg_table "$e") has NO default route" "/etc/gateway/gw-routes.sh up <channel>"
+    fi
+done
+
+# ---------------------------------------------------------------------------
+section "actual paths"
+# The decisive check: a flushed rule set leaves clients connected while their
+# traffic silently leaves the wrong way, and nothing else reveals it.
+rules="$(ip rule show)"
+for c in $INGRESS_CHANNELS; do
+    iface="$(ch_iface "$c")"; net="$(ch_net "$c")"
+    ip link show "$iface" &>/dev/null || continue
+    want="$(eg_iface "$(ch_egress "$c")")"
+    probe="${net%.0/24}.2"
+    route="$(ip route get 1.1.1.1 from "$probe" iif "$iface" 2>/dev/null | head -1)"
+    dev="$(awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' <<< "$route")"
+    if [[ -z "$route" ]]; then
+        fail "${c}: no route for client traffic" "/etc/gateway/gw-routes.sh up ${c}"
+    elif [[ "$dev" == "$want" ]]; then
+        pass "${c}: client traffic exits via ${dev} (egress '$(ch_egress "$c")')"
+    else
+        fail "${c}: LEAKING via ${dev}, expected ${want}" "/etc/gateway/gw-routes.sh up ${c}"
+    fi
+    grep -q "from ${net} lookup $(eg_table "$(ch_egress "$c")")" <<< "$rules" \
+        && pass "${c}: default egress rule present" \
+        || fail "${c}: no policy rule for ${net}" "/etc/gateway/gw-routes.sh up ${c}"
+done
+
+# ---------------------------------------------------------------------------
+section "isolation"
+fwd="$(iptables -S FORWARD 2>/dev/null)"
+for c in $INGRESS_CHANNELS; do
+    net="$(ch_net "$c")"
+    iso="$(cfg "INGRESS_${c}_ISOLATE")"; iso="${iso:-no}"
+    reach="$(cfg "INGRESS_${c}_REACH")"
+    if [[ "$iso" == "yes" ]]; then
+        grep -q -- "-s ${net} -d ${net} .*-j DROP" <<< "$fwd" \
+            && pass "${c}: isolated, clients cannot see each other" \
+            || fail "${c}: ISOLATE=yes but no intra-channel DROP rule"
+    fi
+    for other in $INGRESS_CHANNELS; do
+        [[ "$other" == "$c" ]] && continue
+        onet="$(ch_net "$other")"; [[ -n "$onet" ]] || continue
+        if [[ "$iso" == "yes" || " ${reach} " != *" ${other} "* ]]; then
+            grep -q -- "-s ${net} -d ${onet} -j DROP" <<< "$fwd" \
+                && pass "${c} cannot reach ${other}" \
+                || fail "${c} -> ${other} is NOT blocked" "expected a DROP for ${net} -> ${onet}"
+        fi
+    done
+done
+
+# ---------------------------------------------------------------------------
+section "nat & firewall"
+grep -q MASQUERADE <<< "$(iptables -t nat -S POSTROUTING)" \
+    && pass "MASQUERADE present" || fail "no MASQUERADE — clients get no internet"
+grep -q "dport 53 .*DNAT" <<< "$(iptables -t nat -S PREROUTING)" \
+    && pass "client DNS is redirected to the gateway" || warn "no DNS redirect — clients may use their own resolver"
+grep -q TCPMSS <<< "$(iptables -t mangle -S FORWARD)" \
+    && pass "MSS clamping active" || warn "no MSS clamp — expect stalled TCP on some paths"
+grep -q "dport 853 -j REJECT" <<< "$fwd" \
+    && pass "DoT blocked, clients cannot bypass the gateway resolver" || warn "DoT is not blocked"
+
+# ---------------------------------------------------------------------------
+if [[ -n "$POLICY_RULES" ]]; then
+section "destination policy"
+for r in $POLICY_RULES; do
+    for s in "gwp_${r}" "gwpd_${r}"; do
+        if ipset list -n 2>/dev/null | grep -qx "$s"; then
+            n="$(ipset list "$s" 2>/dev/null | awk '/Number of entries/{print $4}')"
+            pass "ipset ${s} (${n} entries)"
+        else
+            fail "ipset ${s} missing" "/etc/gateway/gw-routes.sh up <channel>"
+        fi
+    done
+done
+fi
+
+# ---------------------------------------------------------------------------
+if [[ "$DNS_STACK" == "yes" ]]; then
+section "dns"
+for svc in dnsmasq dnscrypt-proxy; do
+    systemctl is-active --quiet "$svc" && pass "${svc} running" || fail "${svc} not running" "journalctl -u ${svc} -n50"
+done
+[[ "$DNS_FILTER_ENABLE" == "yes" ]] && { systemctl is-active --quiet AdGuardHome && pass "DNS filter running" \
+    || fail "DNS filter (AdGuardHome) not running" "journalctl -u AdGuardHome -n50"; }
+
+if command -v dig >/dev/null; then
+    dnsmasq_port=5353; [[ "$DNS_FILTER_ENABLE" == "yes" ]] || dnsmasq_port=53
+    t0=$(date +%s%N)
+    dig +time=3 +tries=1 @127.0.0.1 -p 5354 example.com A +short >/dev/null 2>&1 \
+        && pass "dnscrypt-proxy resolves ($(( ($(date +%s%N)-t0)/1000000 ))ms)" \
+        || fail "dnscrypt-proxy (127.0.0.1:5354) does not resolve" "journalctl -u dnscrypt-proxy -n50"
+    t0=$(date +%s%N)
+    dig +time=3 +tries=1 @127.0.0.1 -p "$dnsmasq_port" example.com A +short >/dev/null 2>&1 \
+        && pass "dnsmasq resolves ($(( ($(date +%s%N)-t0)/1000000 ))ms)" \
+        || fail "dnsmasq (127.0.0.1:${dnsmasq_port}) does not resolve"
+    for c in $INGRESS_CHANNELS; do
+        ip link show "$(ch_iface "$c")" &>/dev/null || continue
+        gw="$(net_gw "$(ch_net "$c")")"
+        t0=$(date +%s%N)
+        if dig +time=3 +tries=1 "@${gw}" example.com A +short >/dev/null 2>&1; then
+            ms=$(( ($(date +%s%N)-t0)/1000000 ))
+            [[ $ms -lt 500 ]] && pass "${c}: resolver at ${gw} answers (${ms}ms)" \
+                              || warn "${c}: resolver is slow (${ms}ms)" "check which DoH upstreams dnscrypt-proxy uses — see docs/TROUBLESHOOTING.md"
+        else
+            fail "${c}: resolver at ${gw} does not answer — these clients have no DNS"
+        fi
+    done
+else
+    warn "dig not installed, skipping resolution checks" "apt install dnsutils"
+fi
+fi
+
+# ---------------------------------------------------------------------------
+section "reachability"
+if [[ -z "$GATEWAY_HOST" ]]; then
+    fail "GATEWAY_HOST is empty — issued client configs are unusable"
+else
+    if [[ "$GATEWAY_HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        resolved="$GATEWAY_HOST"
+    else
+        resolved="$(getent ahostsv4 "$GATEWAY_HOST" 2>/dev/null | awk '{print $1; exit}')"
+    fi
+    if [[ -z "$resolved" ]]; then
+        fail "GATEWAY_HOST '${GATEWAY_HOST}' does not resolve — clients cannot find this gateway"
+    else
+        pass "GATEWAY_HOST ${GATEWAY_HOST} -> ${resolved}"
+        if ip -4 addr show | grep -q "inet ${resolved}/"; then
+            pass "that address is bound locally"
+        else
+            ports=""
+            for c in $INGRESS_CHANNELS; do ports="${ports}${ports:+, }UDP $(ch_port "$c")"; done
+            warn "${resolved} is not on a local interface — this gateway is behind NAT" \
+                 "the router must forward ${ports} to this host"
+        fi
+    fi
+fi
+
+printf '\n%s== summary ==%s\n' "$CYAN" "$NC"
+printf '  %s%d pass%s  %s%d warn%s  %s%d fail%s\n' "$GREEN" "$PASSC" "$NC" "$YELLOW" "$WARNC" "$NC" "$RED" "$FAILC" "$NC"
+[[ $FAILC -gt 0 ]] && exit 1
+exit 0

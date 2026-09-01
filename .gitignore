@@ -1,0 +1,13 @@
+# Your real config. It holds egress private keys — never commit it.
+gateway.conf
+
+# Anything the tools emit locally.
+*.png
+clients/
+keys/
+*.log
+
+# Editor / OS noise.
+*.swp
+*~
+.DS_Store

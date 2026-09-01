@@ -1,0 +1,377 @@
+#!/bin/bash
+#
+# gw-client — manage the clients of each ingress channel.
+#
+#   gw-client add <name> [--channel <channel>]
+#   gw-client list [<channel>|all]
+#   gw-client show <name>
+#   gw-client remove <name|ip>
+#   gw-client rename <name|ip> <new-name>
+#   gw-client channels
+#
+# Adding a client takes effect immediately on the running interface — no
+# restart, and nobody else is disconnected. The config and its QR code are
+# written to /etc/gateway/clients/.
+#
+set -uo pipefail
+
+CONF_FILE="${GATEWAY_CONF:-/etc/gateway/gateway.conf}"
+CLIENTS_DIR="/etc/gateway/clients"
+DNSMASQ_CONF="/etc/dnsmasq.conf"
+
+RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; CYAN=$'\033[0;36m'; NC=$'\033[0m'
+die()  { echo "${RED}ERROR:${NC} $*" >&2; exit 1; }
+warn() { echo "${YELLOW}WARN:${NC} $*" >&2; }
+info() { echo "${CYAN}$*${NC}"; }
+ok()   { echo "${GREEN}$*${NC}"; }
+
+[[ $EUID -eq 0 ]] || die "must run as root"
+[[ -r "$CONF_FILE" ]] || die "config not readable: $CONF_FILE"
+# shellcheck disable=SC1090
+source "$CONF_FILE"
+: "${INGRESS_CHANNELS:=}"
+: "${EGRESS_PATHS:=direct}"
+: "${DNS_STACK:=yes}"
+: "${GATEWAY_HOST:?GATEWAY_HOST must be set in $CONF_FILE}"
+
+cfg() { local v="$1"; echo "${!v-}"; }
+ch_type()   { cfg "INGRESS_${1}_TYPE"; }
+ch_port()   { cfg "INGRESS_${1}_PORT"; }
+ch_net()    { cfg "INGRESS_${1}_NET"; }
+ch_mtu()    { cfg "INGRESS_${1}_MTU"; }
+ch_egress() { local e; e="$(cfg "INGRESS_${1}_EGRESS")"; [[ -n "$e" ]] || e="$(echo "$EGRESS_PATHS" | awk '{print $1}')"; echo "$e"; }
+ch_iface()  { echo "in-$1"; }
+ch_isolate(){ local v; v="$(cfg "INGRESS_${1}_ISOLATE")"; echo "${v:-no}"; }
+
+ch_conf() {
+    case "$(ch_type "$1")" in
+        awg) echo "/etc/amnezia/amneziawg/in-${1}.conf" ;;
+        wg|"") echo "/etc/wireguard/in-${1}.conf" ;;
+        *)   echo "" ;;
+    esac
+}
+ch_tool() { [[ "$(ch_type "$1")" == "awg" ]] && echo awg || echo wg; }
+
+channel_exists() { [[ " ${INGRESS_CHANNELS} " == *" ${1} "* ]]; }
+default_channel() { echo "$INGRESS_CHANNELS" | awk '{print $1}'; }
+
+# "10.30.10.0/24" -> "10.30.10". Only /24 is supported: trivial address maths,
+# and 253 clients per channel is far past what this is for.
+net_prefix() {
+    [[ "$1" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.0/24$ ]] || die "only /24 channel networks are supported, got: $1"
+    echo "${BASH_REMATCH[1]}"
+}
+to_slug() { echo "$1" | tr '[:upper:]' '[:lower:]' | sed "s/'//g" | tr -cs '[:alnum:]' '-' | sed 's/^-//;s/-$//'; }
+
+CH=""; CONF=""; TOOL=""; IFACE=""; NET=""; MTU=""; PORT=""; KEEPALIVE=""
+channel_ctx() {
+    CH="$1"
+    channel_exists "$CH" || die "unknown channel '${CH}' (have: ${INGRESS_CHANNELS})"
+    CONF="$(ch_conf "$CH")"; TOOL="$(ch_tool "$CH")"; IFACE="$(ch_iface "$CH")"
+    NET="$(ch_net "$CH")";   MTU="$(ch_mtu "$CH")";   PORT="$(ch_port "$CH")"
+    [[ "$TOOL" == "awg" ]] && KEEPALIVE=25 || KEEPALIVE=15
+    [[ -r "$CONF" ]] || die "$CONF not readable — has install.sh run?"
+    command -v "$TOOL" >/dev/null || die "$TOOL binary missing"
+    $TOOL show "$IFACE" >/dev/null 2>&1 || die "interface $IFACE is not up"
+}
+
+next_ip() {
+    local prefix i ip; prefix="$(net_prefix "$NET")"
+    for i in $(seq 2 254); do
+        ip="${prefix}.${i}"
+        grep -q "AllowedIPs = ${ip}/32" "$CONF" && continue
+        echo "$ip"; return 0
+    done
+    return 1
+}
+
+# AmneziaWG's obfuscation parameters live in the server's [Interface] block and
+# must appear verbatim in every client config, or the two sides disagree about
+# what the packets look like and nothing connects.
+read_obfuscation() {
+    awk '/^\[Interface\]/{i=1;next} /^\[Peer\]/{i=0} i && /^(Jc|Jmin|Jmax|S1|S2|H1|H2|H3|H4)[[:space:]]*=/' "$CONF"
+}
+
+# "pubkey<TAB>ip<TAB>channel" for a client identified by name or address.
+find_client() {
+    local search="$1" c conf
+    for c in $INGRESS_CHANNELS; do
+        conf="$(ch_conf "$c")"; [[ -r "$conf" ]] || continue
+        awk -v want="$search" -v ch="$c" '
+            /^\[Peer\]/ { inp=1; name=""; pub=""; next }
+            /^\[/ && !/^\[Peer\]/ { inp=0 }
+            inp && /^# Name:/    { name = substr($0, 9) }
+            inp && /^PublicKey/  { pub  = $3 }
+            inp && /^AllowedIPs/ { ip=$3; sub(/\/32$/,"",ip)
+                                   if (name==want || ip==want) { print pub "\t" ip "\t" ch; exit } }
+        ' "$conf"
+    done
+}
+name_taken() {
+    local c conf
+    for c in $INGRESS_CHANNELS; do
+        conf="$(ch_conf "$c")"; [[ -r "$conf" ]] || continue
+        grep -qx "# Name: ${1}" "$conf" && return 0
+    done
+    return 1
+}
+
+# --- Local names -------------------------------------------------------------
+# dnsmasq's SIGHUP re-reads /etc/hosts but NOT the config file, so a reload
+# would silently ignore a new record. It has to be a restart; clients see a
+# sub-second DNS gap.
+dns_add() {
+    [[ "$DNS_STACK" == "yes" && -w "$DNSMASQ_CONF" ]] || return 0
+    local slug="$1" ip="$2" rev
+    rev="$(echo "$ip" | awk -F. '{print $4"."$3"."$2"."$1}')"
+    grep -q "^address=/${slug}.gw/" "$DNSMASQ_CONF" && return 0
+    { echo "address=/${slug}.gw/${ip}"; echo "ptr-record=${rev}.in-addr.arpa,${slug}.gw"; } >> "$DNSMASQ_CONF"
+    systemctl restart dnsmasq 2>/dev/null || true
+}
+dns_remove() {
+    [[ "$DNS_STACK" == "yes" && -w "$DNSMASQ_CONF" ]] || return 0
+    sed -i "\#^address=/${1}\.gw/#d;\#,${1}\.gw\$#d" "$DNSMASQ_CONF"
+    systemctl restart dnsmasq 2>/dev/null || true
+}
+
+# --- Commands ----------------------------------------------------------------
+cmd_add() {
+    local name="" channel=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --channel|-c) channel="${2:-}"; shift 2 ;;
+            -*) die "unknown option: $1" ;;
+            *)  name="${name:+$name }$1"; shift ;;
+        esac
+    done
+    [[ -n "$name" ]] || die "usage: gw-client add <name> [--channel <channel>]"
+    [[ -n "$channel" ]] || channel="$(default_channel)"
+    [[ -n "$channel" ]] || die "no ingress channels are configured"
+
+    channel_ctx "$channel"
+    name_taken "$name" && die "client name '$name' is already in use"
+
+    local slug; slug="$(to_slug "$name")"
+    [[ -n "$slug" ]] || die "name '$name' reduces to an empty slug"
+    local client_file="${CLIENTS_DIR}/${slug}-${CH}.conf"
+    [[ -e "$client_file" ]] && die "$client_file already exists"
+
+    local ip dns_ip; ip="$(next_ip)" || die "address pool exhausted for $NET"
+    dns_ip="$(net_prefix "$NET").1"
+
+    local priv pub psk server_pub obfuscation=""
+    priv="$($TOOL genkey)"; pub="$(echo "$priv" | $TOOL pubkey)"; psk="$($TOOL genpsk)"
+    server_pub="$($TOOL show "$IFACE" public-key)"
+    if [[ "$TOOL" == "awg" ]]; then
+        obfuscation="$(read_obfuscation)"
+        [[ -n "$obfuscation" ]] || die "no obfuscation parameters in $CONF [Interface]"
+    fi
+
+    cp -a "$CONF" "${CONF}.bak"
+    $TOOL set "$IFACE" peer "$pub" preshared-key <(echo "$psk") \
+        allowed-ips "${ip}/32" persistent-keepalive "$KEEPALIVE" \
+        || die "failed to add the client to the running interface"
+
+    if ! cat >> "$CONF" <<PEEREOF
+
+[Peer]
+# Name: $name
+# Created: $(date '+%Y-%m-%d %H:%M:%S')
+PublicKey = $pub
+PresharedKey = $psk
+AllowedIPs = ${ip}/32
+PersistentKeepalive = $KEEPALIVE
+PEEREOF
+    then
+        $TOOL set "$IFACE" peer "$pub" remove 2>/dev/null || true
+        cp -a "${CONF}.bak" "$CONF"
+        die "failed to persist the client to $CONF (rolled back)"
+    fi
+
+    mkdir -p "$CLIENTS_DIR"; chmod 700 "$CLIENTS_DIR"
+    {
+        echo "[Interface]"
+        echo "# $name — channel '${CH}' via egress '$(ch_egress "$CH")'"
+        echo "PrivateKey = $priv"
+        echo "Address = ${ip}/32"
+        echo "DNS = $dns_ip"
+        echo "MTU = ${MTU:-1420}"
+        [[ -n "$obfuscation" ]] && echo "$obfuscation"
+        echo
+        echo "[Peer]"
+        echo "PublicKey = $server_pub"
+        echo "PresharedKey = $psk"
+        echo "Endpoint = ${GATEWAY_HOST}:${PORT}"
+        echo "AllowedIPs = 0.0.0.0/0"
+        echo "PersistentKeepalive = $KEEPALIVE"
+    } > "$client_file"
+    chmod 600 "$client_file"
+
+    [[ "$(ch_isolate "$CH")" == "yes" ]] || dns_add "$slug" "$ip"
+
+    ok "Added '${name}' to channel '${CH}' at ${ip}"
+    echo
+    if command -v qrencode >/dev/null; then
+        qrencode -t ansiutf8 < "$client_file"
+        qrencode -t png -o "${client_file%.conf}.png" < "$client_file" 2>/dev/null && \
+            echo "QR image: ${client_file%.conf}.png"
+    else
+        warn "qrencode not installed — no QR code (apt install qrencode)"
+    fi
+    echo "Config:   $client_file"
+    echo "Egress:   $(ch_egress "$CH")"
+    if [[ "$TOOL" == "awg" ]]; then
+        echo "App:      AmneziaWG (the stock WireGuard app cannot read these settings)"
+    else
+        echo "App:      any standard WireGuard client"
+    fi
+}
+
+cmd_remove() {
+    local search="${1:-}"; [[ -n "$search" ]] || die "usage: gw-client remove <name|ip>"
+    local found pub ip channel
+    found="$(find_client "$search")"; [[ -n "$found" ]] || die "no client matching '$search'"
+    IFS=$'\t' read -r pub ip channel <<< "$found"
+    channel_ctx "$channel"
+
+    # Public keys are base64 and contain +, / and = — compare as a string, never
+    # as a regex.
+    local name; name="$(awk -v p="$pub" '/^# Name:/{n=substr($0,9)} $0 == "PublicKey = " p {print n; exit}' "$CONF")"
+    local slug; slug="$(to_slug "${name:-$ip}")"
+
+    cp -a "$CONF" "${CONF}.bak"
+    $TOOL set "$IFACE" peer "$pub" remove 2>/dev/null || warn "client was not on the running interface"
+    awk -v pub="$pub" '
+        /^\[Peer\]/ { if (buf != "") { if (!drop) printf "%s", buf } buf=""; drop=0; inp=1 }
+        { if (inp) { buf = buf $0 "\n"; if ($0 == "PublicKey = " pub) drop=1; next } print }
+        END { if (buf != "" && !drop) printf "%s", buf }
+    ' "$CONF" > "${CONF}.tmp" && mv "${CONF}.tmp" "$CONF"
+    chmod 600 "$CONF"
+
+    rm -f "${CLIENTS_DIR}/${slug}-${channel}.conf" "${CLIENTS_DIR}/${slug}-${channel}.png"
+    dns_remove "$slug"
+    ok "Removed '${name:-$ip}' (${ip}) from channel '${channel}'"
+}
+
+cmd_rename() {
+    local old="${1:-}" new="${2:-}"
+    [[ -n "$old" && -n "$new" ]] || die "usage: gw-client rename <name|ip> <new-name>"
+    local found pub ip channel
+    found="$(find_client "$old")"; [[ -n "$found" ]] || die "no client matching '$old'"
+    IFS=$'\t' read -r pub ip channel <<< "$found"
+    name_taken "$new" && die "client name '$new' is already in use"
+    channel_ctx "$channel"
+    cp -a "$CONF" "${CONF}.bak"
+    awk -v pub="$pub" -v new="$new" '
+        { lines[NR]=$0 }
+        END {
+            for (i=1; i<=NR; i++)
+                if (lines[i] == "PublicKey = " pub)
+                    for (j=i-1; j>=1 && lines[j] !~ /^\[Peer\]/; j--)
+                        if (lines[j] ~ /^# Name:/) lines[j] = "# Name: " new
+            for (i=1; i<=NR; i++) print lines[i]
+        }
+    ' "$CONF" > "${CONF}.tmp" && mv "${CONF}.tmp" "$CONF"
+    chmod 600 "$CONF"
+
+    # Move the stored config, its QR and the local DNS record too, or a later
+    # `remove` looks for files under the new name and orphans the old ones.
+    local old_slug new_slug
+    old_slug="$(to_slug "$old")"; new_slug="$(to_slug "$new")"
+    if [[ "$old_slug" != "$new_slug" ]]; then
+        [[ -f "${CLIENTS_DIR}/${old_slug}-${channel}.conf" ]] &&             mv "${CLIENTS_DIR}/${old_slug}-${channel}.conf" "${CLIENTS_DIR}/${new_slug}-${channel}.conf"
+        [[ -f "${CLIENTS_DIR}/${old_slug}-${channel}.png" ]] &&             mv "${CLIENTS_DIR}/${old_slug}-${channel}.png" "${CLIENTS_DIR}/${new_slug}-${channel}.png"
+        if [[ "$(ch_isolate "$channel")" != "yes" ]]; then
+            dns_remove "$old_slug"
+            dns_add "$new_slug" "$ip"
+        fi
+        # The header line inside the config names the client; keep it truthful.
+        sed -i "s|^# ${old} — |# ${new} — |" "${CLIENTS_DIR}/${new_slug}-${channel}.conf" 2>/dev/null || true
+    fi
+    ok "Renamed '${old}' to '${new}' (${ip} on channel '${channel}')"
+}
+
+cmd_list() {
+    local target="${1:-all}" c now; now="$(date +%s)"
+    for c in $INGRESS_CHANNELS; do
+        [[ "$target" == "all" || "$target" == "$c" ]] || continue
+        local conf tool; conf="$(ch_conf "$c")"; tool="$(ch_tool "$c")"
+        [[ -r "$conf" ]] || continue
+        local ctype iso_note; ctype="$(ch_type "$c")"; ctype="${ctype:-wg}"
+        iso_note=""; [[ "$(ch_isolate "$c")" == "yes" ]] && iso_note=" · isolated"
+        info "=== ${c}  (${ctype} · $(ch_net "$c") · egress: $(ch_egress "$c")${iso_note}) ==="
+        local hs_all; hs_all="$($tool show "in-${c}" latest-handshakes 2>/dev/null || true)"
+        local name="" pub="" line
+        while IFS= read -r line; do
+            case "$line" in
+                "# Name: "*)     name="${line#\# Name: }" ;;
+                "[Peer]")        name=""; pub="" ;;
+                "PublicKey = "*) pub="${line#PublicKey = }" ;;
+                "AllowedIPs = "*)
+                    local ip hs ago dot
+                    ip="${line#AllowedIPs = }"; ip="${ip%/32}"
+                    hs="$(echo "$hs_all" | awk -v p="$pub" '$1==p {print $2}')"
+                    if [[ -n "$hs" && "$hs" != "0" ]]; then
+                        ago=$(( now - hs ))
+                        if   [[ $ago -lt 180 ]]; then dot="${GREEN}online${NC} "
+                        elif [[ $ago -lt 900 ]]; then dot="${YELLOW}idle${NC}   "
+                        else                          dot="${RED}offline${NC}"; fi
+                    else dot="${RED}never${NC}  "; fi
+                    printf '  %b  %-24s %-16s %s\n' "$dot" "${name:-unnamed}" "$ip" "${pub:0:16}..."
+                    name=""; pub=""
+                    ;;
+            esac
+        done < "$conf"
+        echo
+    done
+}
+
+cmd_show() {
+    local search="${1:-}"; [[ -n "$search" ]] || die "usage: gw-client show <name>"
+    local found pub ip channel
+    found="$(find_client "$search")"; [[ -n "$found" ]] || die "no client matching '$search'"
+    IFS=$'\t' read -r pub ip channel <<< "$found"
+    local slug f; slug="$(to_slug "$search")"
+    f="${CLIENTS_DIR}/${slug}-${channel}.conf"
+    [[ -r "$f" ]] || die "no stored config at $f (a client added by hand has no file here)"
+    cat "$f"; echo
+    command -v qrencode >/dev/null && qrencode -t ansiutf8 < "$f"
+    return 0
+}
+
+cmd_channels() {
+    local c
+    printf '%-12s %-6s %-18s %-10s %-9s %s\n' CHANNEL TYPE NETWORK EGRESS ISOLATED CLIENTS
+    for c in $INGRESS_CHANNELS; do
+        local conf n; conf="$(ch_conf "$c")"
+        n="$(grep -c '^\[Peer\]' "$conf" 2>/dev/null)" || n=0
+        printf '%-12s %-6s %-18s %-10s %-9s %s\n' \
+            "$c" "$(ch_type "$c")" "$(ch_net "$c")" "$(ch_egress "$c")" "$(ch_isolate "$c")" "$n"
+    done
+}
+
+usage() {
+    cat <<'EOF'
+gw-client — manage the clients of each ingress channel
+
+  gw-client add <name> [--channel <channel>]   create a client (QR printed)
+  gw-client list [<channel>|all]               list clients and last handshake
+  gw-client show <name>                        reprint a config and its QR
+  gw-client remove <name|ip>                   revoke, immediately
+  gw-client rename <name|ip> <new-name>        rename a client
+  gw-client channels                           show the configured channels
+
+Without --channel, the first channel in INGRESS_CHANNELS is used.
+EOF
+}
+
+case "${1:-}" in
+    add)     shift; cmd_add "$@" ;;
+    remove|rm|del) shift; cmd_remove "$@" ;;
+    rename)  shift; cmd_rename "$@" ;;
+    list|ls) shift; cmd_list "$@" ;;
+    show)    shift; cmd_show "$@" ;;
+    channels|ch) shift; cmd_channels "$@" ;;
+    ""|-h|--help|help) usage ;;
+    *) usage; exit 1 ;;
+esac

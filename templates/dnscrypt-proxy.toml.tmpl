@@ -1,0 +1,39 @@
+# dnscrypt-proxy — the encrypted DoH upstream for the whole gateway.
+#
+# Pick resolvers that are fast FROM THIS GATEWAY. These queries leave via
+# DNS_EGRESS, so a resolver that is close to you may be far from that exit and
+# add hundreds of ms to every uncached lookup for every client. Measure with:
+#   sudo -u _dnscrypt-proxy curl -w '%{time_total}\n' -so /dev/null \
+#        'https://<resolver-ip>/dns-query?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB'
+# and compare against the same command run as root, which goes out directly.
+
+listen_addresses = ['127.0.0.1:5354']
+server_names = [@DNSCRYPT_RESOLVERS@]
+
+doh_servers = true
+dnscrypt_servers = false
+require_dnssec = false
+require_nolog = true
+require_nofilter = false
+
+# TCP only: DoH is HTTPS, and forcing TCP keeps every query on the marked,
+# tunnel-routed path rather than leaking UDP.
+force_tcp = true
+block_ipv6 = true
+ignore_system_dns = true
+
+cache = true
+cache_size = 4096
+cache_min_ttl = 600
+cache_max_ttl = 86400
+cache_neg_min_ttl = 60
+cache_neg_max_ttl = 600
+timeout = 5000
+
+[sources]
+  [sources.'public-resolvers']
+  urls = ['https://raw.githubusercontent.com/DNSCrypt/dnscrypt-resolvers/master/v2/public-resolvers.md', 'https://download.dnscrypt.info/resolvers-list/v2/public-resolvers.md']
+  cache_file = '/var/cache/dnscrypt-proxy/public-resolvers.md'
+  minisign_key = 'RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3'
+  refresh_delay = 72
+  prefix = ''

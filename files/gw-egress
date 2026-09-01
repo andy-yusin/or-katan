@@ -1,0 +1,154 @@
+#!/bin/bash
+#
+# gw-egress — inspect and change where each ingress channel's traffic leaves.
+#
+#   gw-egress                          show every egress path and who uses it
+#   gw-egress set <channel> <egress>   repoint one channel
+#   gw-egress set all <egress>         repoint every channel
+#   gw-egress test                     prove where each channel actually exits
+#
+# Changes are live: clients stay connected to their ingress interface and only
+# the path underneath them changes. The choice is written back to the config,
+# so it survives a reboot.
+#
+set -euo pipefail
+
+CONF_FILE="${GATEWAY_CONF:-/etc/gateway/gateway.conf}"
+ROUTES="/etc/gateway/gw-routes.sh"
+MARK_MASK="0xff"
+
+RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; CYAN=$'\033[0;36m'; BOLD=$'\033[1m'; NC=$'\033[0m'
+die() { echo "${RED}ERROR:${NC} $*" >&2; exit 1; }
+
+[[ $EUID -eq 0 ]] || die "must run as root"
+[[ -r "$CONF_FILE" ]] || die "config not readable: $CONF_FILE"
+# shellcheck disable=SC1090
+source "$CONF_FILE"
+: "${INGRESS_CHANNELS:=}"; : "${EGRESS_PATHS:=direct}"
+
+DEF_IF="$(ip route show default | awk '/default/ {print $5; exit}')"
+
+cfg() { local v="$1"; echo "${!v-}"; }
+eg_type() { local t; t="$(cfg "EGRESS_${1}_TYPE")"; [[ -n "$t" ]] || { [[ "$1" == "direct" ]] && t="direct" || t=""; }; echo "$t"; }
+eg_iface(){ [[ "$(eg_type "$1")" == "direct" ]] && echo "$DEF_IF" || echo "out-$1"; }
+eg_table(){ echo "gw_$1"; }
+ch_net()  { cfg "INGRESS_${1}_NET"; }
+ch_egress(){ local e; e="$(cfg "INGRESS_${1}_EGRESS")"; [[ -n "$e" ]] || e="$(echo "$EGRESS_PATHS" | awk '{print $1}')"; echo "$e"; }
+ch_iface(){ echo "in-$1"; }
+egress_exists() { [[ " ${EGRESS_PATHS} " == *" ${1} "* ]]; }
+channel_exists(){ [[ " ${INGRESS_CHANNELS} " == *" ${1} "* ]]; }
+
+# The last handshake on a tunnel egress, in seconds ago. Empty if never.
+eg_age() {
+    local dev="$1" t hs
+    for t in wg awg; do
+        command -v "$t" >/dev/null || continue
+        hs="$($t show "$dev" latest-handshakes 2>/dev/null | awk '{print $2}' | sort -rn | head -1)" || true
+        [[ -n "${hs:-}" && "$hs" != "0" ]] && { echo $(( $(date +%s) - hs )); return 0; }
+    done
+    echo ""
+}
+
+show_status() {
+    local e dev state age users c
+    printf '%s%-10s %-8s %-12s %-22s %s%s\n' "$BOLD" EGRESS TYPE INTERFACE STATE "CHANNELS" "$NC"
+    for e in $EGRESS_PATHS; do
+        dev="$(eg_iface "$e")"
+        if [[ "$(eg_type "$e")" == "direct" ]]; then
+            state="${GREEN}uplink${NC}"
+        elif ip link show "$dev" &>/dev/null; then
+            age="$(eg_age "$dev")"
+            if   [[ -z "$age" ]];        then state="${RED}no handshake${NC}"
+            elif [[ "$age" -lt 300 ]];   then state="${GREEN}up (${age}s ago)${NC}"
+            else                              state="${RED}stale (${age}s ago)${NC}"; fi
+        else
+            state="${RED}down${NC}"
+        fi
+        users=""
+        for c in $INGRESS_CHANNELS; do
+            [[ "$(ch_egress "$c")" == "$e" ]] && users="${users}${users:+, }${c}"
+        done
+        printf '%-10s %-8s %-12s %-22b %s\n' "$e" "$(eg_type "$e")" "$dev" "$state" "${users:--}"
+    done
+    echo
+    echo "${CYAN}routing tables${NC}"
+    for e in $EGRESS_PATHS; do
+        printf '  %-10s %s\n' "$e" "$(ip route show table "$(eg_table "$e")" 2>/dev/null | tr '\n' ' ' | sed 's/  */ /g')"
+    done
+}
+
+# The decisive check: ask the kernel where a packet from a real client address
+# would actually go. This is what catches flushed policy rules, which otherwise
+# leave clients connected while silently egressing from the wrong place.
+show_test() {
+    local c net probe route want dev
+    echo "${CYAN}actual egress per channel${NC}"
+    for c in $INGRESS_CHANNELS; do
+        net="$(ch_net "$c")"
+        ip link show "$(ch_iface "$c")" &>/dev/null || { printf '  %-12s %s\n' "$c" "interface down"; continue; }
+        probe="${net%.0/24}.2"
+        route="$(ip route get 1.1.1.1 from "$probe" iif "$(ch_iface "$c")" 2>/dev/null | head -1)" || route=""
+        want="$(eg_iface "$(ch_egress "$c")")"
+        dev="$(awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' <<< "$route")"
+        if [[ -z "$route" ]]; then
+            printf '  %-12s %sno route%s (expected %s)\n' "$c" "$RED" "$NC" "$want"
+        elif [[ "$dev" == "$want" ]]; then
+            printf '  %-12s %s%s%s via %s\n' "$c" "$GREEN" "$dev" "$NC" "$(ch_egress "$c")"
+        else
+            printf '  %-12s %sLEAKING: %s, expected %s%s\n' "$c" "$RED" "${dev:-?}" "$want" "$NC"
+        fi
+    done
+}
+
+cmd="${1:-status}"
+case "$cmd" in
+    status|"") show_status; echo; show_test; exit 0 ;;
+    test)      show_test; exit 0 ;;
+    set)       ;;
+    *) die "usage: gw-egress [status|test|set <channel|all> <egress>]" ;;
+esac
+
+target_ch="${2:-}"; target_eg="${3:-}"
+[[ -n "$target_ch" && -n "$target_eg" ]] || die "usage: gw-egress set <channel|all> <egress>"
+egress_exists "$target_eg" || die "'${target_eg}' is not in EGRESS_PATHS (${EGRESS_PATHS})"
+
+channels=""
+if [[ "$target_ch" == "all" ]]; then
+    channels="$INGRESS_CHANNELS"
+else
+    channel_exists "$target_ch" || die "'${target_ch}' is not in INGRESS_CHANNELS (${INGRESS_CHANNELS})"
+    channels="$target_ch"
+fi
+
+# Refuse to point a channel at an egress that cannot carry it — the result
+# would be a fail-closed blackhole that looks like a broken VPN.
+if [[ "$(eg_type "$target_eg")" != "direct" ]]; then
+    dev="$(eg_iface "$target_eg")"
+    if ! ip link show "$dev" &>/dev/null; then
+        echo "${YELLOW}bringing up ${dev}...${NC}"
+        if [[ -f "/etc/amnezia/amneziawg/${dev}.conf" ]]; then awg-quick up "$dev"; else wg-quick up "$dev"; fi
+    fi
+    ip link show "$dev" &>/dev/null || die "${dev} will not come up; refusing to switch"
+fi
+
+for c in $channels; do
+    if grep -q "^INGRESS_${c}_EGRESS=" "$CONF_FILE"; then
+        sed -i "s|^INGRESS_${c}_EGRESS=.*|INGRESS_${c}_EGRESS=\"${target_eg}\"|" "$CONF_FILE"
+    else
+        echo "INGRESS_${c}_EGRESS=\"${target_eg}\"" >> "$CONF_FILE"
+    fi
+done
+
+# gw-routes.sh re-reads the config and is the single place that knows how to
+# stage routes, NAT and marks consistently.
+for c in $channels; do
+    ip link show "$(ch_iface "$c")" &>/dev/null || continue
+    "$ROUTES" up "$c" >/dev/null
+done
+
+echo "${GREEN}${channels// /, } -> ${target_eg}${NC}"
+echo
+# Re-read so the summary reflects what was just written.
+# shellcheck disable=SC1090
+source "$CONF_FILE"
+show_status; echo; show_test

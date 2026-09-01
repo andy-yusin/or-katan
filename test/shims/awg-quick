@@ -1,0 +1,8 @@
+#!/bin/bash
+# Test shim: strip the AmneziaWG-only [Interface] keys and hand the rest to
+# wg-quick, so the obfuscated code path is still exercised end to end.
+action="$1"; iface="$2"
+src="/etc/amnezia/amneziawg/${iface}.conf"
+dst="/etc/wireguard/${iface}.conf"
+[ -f "$src" ] && grep -vE '^(Jc|Jmin|Jmax|S1|S2|H1|H2|H3|H4) *=' "$src" > "$dst"
+exec wg-quick "$action" "$iface"

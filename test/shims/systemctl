@@ -1,0 +1,34 @@
+#!/bin/bash
+# Test shim: no systemd in a container, so translate unit actions into the
+# real commands the units would run.
+cmd="${1:-}"; shift || true
+args=("$@")
+unit="${args[0]:-}"
+unit="${unit%.service}"
+case "$cmd" in
+  daemon-reload|enable|disable|mask|unmask|reload|reload-or-restart) exit 0 ;;
+  is-active)
+    [[ "${args[0]}" == "--quiet" ]] && unit="${args[1]%.service}"
+    case "$unit" in
+      wg-quick@*)  ip link show "${unit#wg-quick@}"  &>/dev/null && exit 0 || exit 3 ;;
+      awg-quick@*) ip link show "${unit#awg-quick@}" &>/dev/null && exit 0 || exit 3 ;;
+      dnsmasq)          pgrep -x dnsmasq        >/dev/null && exit 0 || exit 3 ;;
+      dnscrypt-proxy)   pgrep -x dnscrypt-proxy >/dev/null && exit 0 || exit 3 ;;
+      AdGuardHome)      pgrep -x AdGuardHome    >/dev/null && exit 0 || exit 3 ;;
+      *) exit 3 ;;
+    esac ;;
+  start|restart)
+    case "$unit" in
+      wg-quick@*)  wg-quick  down "${unit#wg-quick@}"  &>/dev/null; wg-quick  up "${unit#wg-quick@}" ;;
+      awg-quick@*) awg-quick down "${unit#awg-quick@}" &>/dev/null; awg-quick up "${unit#awg-quick@}" ;;
+      dnsmasq)        pkill -x dnsmasq; sleep 0.3; dnsmasq --conf-file=/etc/dnsmasq.conf ;;
+      dnscrypt-proxy) pkill -x dnscrypt-proxy; sleep 0.3
+                      setsid dnscrypt-proxy -config /etc/dnscrypt-proxy/dnscrypt-proxy.toml >/var/log/dnscrypt.log 2>&1 &
+                      sleep 3 ;;
+      AdGuardHome)    pkill -x AdGuardHome; sleep 0.3
+                      setsid /opt/AdGuardHome/AdGuardHome -s run --no-check-update -w /opt/AdGuardHome >/var/log/agh.log 2>&1 &
+                      sleep 4 ;;
+      *) exit 0 ;;
+    esac ;;
+  *) exit 0 ;;
+esac

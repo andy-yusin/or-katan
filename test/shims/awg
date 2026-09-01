@@ -1,0 +1,4 @@
+#!/bin/bash
+# Test shim: AmneziaWG's DKMS module cannot build against the container kernel.
+# awg's CLI is wg's CLI, so map it straight through.
+exec wg "$@"

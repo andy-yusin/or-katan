@@ -1,0 +1,23 @@
+# Ingress channel "@CHANNEL@" — AmneziaWG (obfuscated).
+# Managed by gateway-kit. Clients are appended below by `gw-client add`.
+#
+# Jc/Jmin/Jmax/S1/S2/H1..H4 are this gateway's obfuscation signature. They were
+# generated randomly at install time and must appear verbatim in every client
+# config (gw-client copies them automatically). Changing them here disconnects
+# every existing client on this channel.
+[Interface]
+Address = @GW_ADDR@/24
+ListenPort = @PORT@
+PrivateKey = @PRIVKEY@
+MTU = @MTU@
+Jc = @JC@
+Jmin = @JMIN@
+Jmax = @JMAX@
+S1 = @S1@
+S2 = @S2@
+H1 = @H1@
+H2 = @H2@
+H3 = @H3@
+H4 = @H4@
+PostUp = /etc/gateway/gw-routes.sh up @CHANNEL@
+PostDown = /etc/gateway/gw-routes.sh down @CHANNEL@

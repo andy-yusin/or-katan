@@ -1,0 +1,12 @@
+# Ingress channel "@CHANNEL@" — plain WireGuard.
+# Managed by gateway-kit. Clients are appended below by `gw-client add`.
+#
+# Routing, NAT and firewall are not left to wg-quick: PostUp hands that to
+# gw-routes.sh, which is the single place that knows the whole policy.
+[Interface]
+Address = @GW_ADDR@/24
+ListenPort = @PORT@
+PrivateKey = @PRIVKEY@
+MTU = @MTU@
+PostUp = /etc/gateway/gw-routes.sh up @CHANNEL@
+PostDown = /etc/gateway/gw-routes.sh down @CHANNEL@

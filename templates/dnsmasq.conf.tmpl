@@ -1,0 +1,37 @@
+# dnsmasq — the middle layer of the DNS chain.
+#
+#   DNS filter (:53) -> dnsmasq (:5353) -> dnscrypt-proxy (:5354) -> DoH
+#
+# dnsmasq sits in the middle for two things neither neighbour can do:
+#   1. it drops each answer into a destination-policy ipset as the name
+#      resolves, which is what makes per-domain egress routing work without
+#      maintaining CIDR lists;
+#   2. it serves the local <client>.gw names.
+
+# --- Listener ---
+# With the filter in front, dnsmasq is an internal hop on :5353. Without it,
+# dnsmasq is itself the client-facing resolver and binds the channel gateway
+# addresses on :53. bind-dynamic, not bind-interfaces, so it can bind addresses
+# that only appear when the ingress interfaces come up.
+listen-address=@DNSMASQ_LISTEN@
+port=@DNSMASQ_PORT@
+bind-dynamic
+
+# --- Upstreams ---
+no-resolv
+no-hosts
+# strict-order = try servers in the order listed, never in parallel. Without it
+# dnsmasq races them and the encrypted upstream loses to the plaintext fallback.
+strict-order
+server=127.0.0.1#5354
+@DNS_FALLBACK_LINE@
+cache-size=1000
+
+@POLICY_SERVERS@
+@POLICY_IPSETS@
+
+# --- Local names (<client>.gw) ---
+local=/gw/
+@LOCAL_PTR_ZONES@
+
+# gw-client appends address= and ptr-record= lines below this point.

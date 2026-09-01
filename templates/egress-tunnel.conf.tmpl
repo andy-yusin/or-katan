@@ -1,0 +1,17 @@
+# Egress path "@EGRESS@" — tunnel to an exit server.
+#
+# Table = off is essential: wg-quick must NOT install a default route of its
+# own. gw-routes.sh owns the routing and points table gw_@EGRESS@ at this
+# interface. ListenPort is unique per tunnel so they never contend for a port.
+[Interface]
+Address = @ADDRESS@
+ListenPort = @PORT@
+PrivateKey = @PRIVKEY@
+Table = off
+
+[Peer]
+PublicKey = @PUBKEY@
+@PSK_LINE@
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = @ENDPOINT@
+PersistentKeepalive = 25

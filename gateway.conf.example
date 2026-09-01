@@ -1,0 +1,221 @@
+# =============================================================================
+# gateway-kit configuration
+# =============================================================================
+# A routing gateway with named ingress channels (who comes in, and under what
+# policy) and named egress paths (how their traffic leaves).
+#
+# Copy to gateway.conf, edit, run ./install.sh.
+# Installed to /etc/gateway/gateway.conf and read at runtime by every tool.
+#
+# Shell syntax. Channel names must be lowercase [a-z0-9_], 12 chars or fewer —
+# they become interface names (in-<name> / out-<name>) and shell variable
+# suffixes.
+# =============================================================================
+
+# Public hostname or IP clients connect to. A DNS name is strongly preferred:
+# it is baked into every client config, so with a name you can move the box and
+# clients follow. With a bare IP you must reissue every config.
+GATEWAY_HOST="gw.example.com"
+
+
+# =============================================================================
+# EGRESS PATHS — how traffic leaves
+# =============================================================================
+# List them in order. The first one is the default for anything that does not
+# say otherwise.
+#
+#   TYPE=direct   leaves from this box's own uplink. "direct" is always
+#                 available implicitly; declare it only to control ordering.
+#   TYPE=tunnel   leaves through a WireGuard/AmneziaWG tunnel you terminate
+#                 elsewhere. The exit IP is that machine's.
+#
+# As shipped this is a single-hop gateway: everything leaves from this box's
+# own uplink. Add tunnel paths below when you have an exit server — see
+# docs/EXIT-SERVER.md — and point channels or policy rules at them.
+EGRESS_PATHS="direct"
+
+# --- direct: this box's own uplink ------------------------------------------
+# Always available even if it is not listed. Declare it to control ordering:
+# the first entry in EGRESS_PATHS is the default for channels that name none.
+EGRESS_direct_TYPE="direct"
+
+# --- main: a tunnel to an exit server abroad --------------------------------
+# Uncomment, fill in, add "main" to EGRESS_PATHS, and point channels at it.
+#EGRESS_main_TYPE="tunnel"
+#EGRESS_main_PROTO="wg"                    # wg | awg
+#EGRESS_main_ENDPOINT="203.0.113.10:51820" # the exit server
+#EGRESS_main_PUBKEY=""                     # exit server's public key
+#EGRESS_main_PRIVKEY=""                    # this gateway's private key on that peer
+#EGRESS_main_PSK=""                        # optional preshared key
+#EGRESS_main_ADDRESS="10.0.0.2/24"         # address the exit assigned to us
+#EGRESS_main_PORT="51900"                  # local listen port, unique per tunnel
+
+# --- backup: a second exit ---------------------------------------------------
+#EGRESS_backup_TYPE="tunnel"
+#EGRESS_backup_PROTO="wg"
+#EGRESS_backup_ENDPOINT=""
+#EGRESS_backup_PUBKEY=""
+#EGRESS_backup_PRIVKEY=""
+#EGRESS_backup_ADDRESS="10.1.0.2/24"
+#EGRESS_backup_PORT="51901"
+
+# --- video: an exit inside the country a streaming service expects ------------
+# A separate path purely so video services see an address in the right place.
+# Worth its own egress rather than reusing "main": the country that makes
+# streaming work is rarely the country you want everything else to come from.
+#EGRESS_video_TYPE="tunnel"
+#EGRESS_video_PROTO="wg"
+#EGRESS_video_ENDPOINT="198.51.100.7:51820"
+#EGRESS_video_PUBKEY=""
+#EGRESS_video_PRIVKEY=""
+#EGRESS_video_ADDRESS="10.2.0.2/24"
+#EGRESS_video_PORT="51902"
+
+# If a provider gave you a ready-made .conf instead of separate values, point at
+# it and omit the fields above — the installer enforces Table=off and the port:
+#EGRESS_main_TYPE="tunnel"
+#EGRESS_main_CONF_FILE="/root/provider-nl.conf"
+#EGRESS_main_PORT="51900"
+
+
+# =============================================================================
+# INGRESS CHANNELS — who comes in
+# =============================================================================
+# Each channel is its own interface, port, subnet and policy. Give different
+# groups different channels: you can then route, isolate and revoke them
+# independently, and a leaked config from one costs you only that one.
+#
+#   TYPE=wg    plain WireGuard. Fastest, stock app on every platform. Some
+#              mobile carriers fingerprint and silently drop it.
+#   TYPE=awg   AmneziaWG: same protocol, obfuscated so it does not look like
+#              WireGuard. Needs the AmneziaWG app. Use where wg is blocked.
+#
+#   EGRESS     which egress path this channel's traffic takes by default
+#   ISOLATE    yes = clients cannot see each other or any other channel
+#   REACH      other channels this one may reach (only when ISOLATE=no)
+#
+INGRESS_CHANNELS="family friends work"
+
+# --- family: trusted devices, can see each other -----------------------------
+INGRESS_family_TYPE="awg"
+INGRESS_family_PORT="51820"
+INGRESS_family_NET="10.30.10.0/24"
+INGRESS_family_MTU="1340"
+INGRESS_family_EGRESS="direct"
+INGRESS_family_ISOLATE="no"
+INGRESS_family_REACH=""
+
+# --- friends: internet only, no visibility of anything else ------------------
+INGRESS_friends_TYPE="awg"
+INGRESS_friends_PORT="51821"
+INGRESS_friends_NET="10.30.20.0/24"
+INGRESS_friends_MTU="1340"
+INGRESS_friends_EGRESS="direct"
+INGRESS_friends_ISOLATE="yes"
+INGRESS_friends_REACH=""
+
+# --- work: plain WireGuard, out the backup path ------------------------------
+INGRESS_work_TYPE="wg"
+INGRESS_work_PORT="51822"
+INGRESS_work_NET="10.30.30.0/24"
+INGRESS_work_MTU="1420"
+INGRESS_work_EGRESS="direct"
+INGRESS_work_ISOLATE="no"
+INGRESS_work_REACH=""
+
+
+# =============================================================================
+# DESTINATION POLICY — exceptions to the per-channel default
+# =============================================================================
+# Send specific destinations out a different egress than the channel's default,
+# for every channel at once.
+#
+# Matching is primarily per-domain: dnsmasq drops each answer into that rule's
+# ipset as the name resolves, so CDNs and rotating addresses are covered without
+# maintaining lists. CIDRS is the escape hatch for destinations that domain
+# matching structurally cannot catch (see the video example below).
+#
+# Rules are evaluated in the order listed and THE LAST MATCH WINS, which is how
+# you carve a narrow exception out of a broad rule.
+POLICY_RULES=""
+
+# --- Worked example ----------------------------------------------------------
+# Two rules: keep national services on the local uplink, and send video out a
+# dedicated in-country exit. Uncomment, add "video" to EGRESS_PATHS, and declare
+# the video egress above.
+#
+#   POLICY_RULES="local video"
+#
+# National domains resolve to national addresses and go straight out, so they
+# stay fast and never see a foreign address. POLICY_local_DNS gives them their
+# own resolver, pinned to the uplink — both because a national resolver returns
+# better-located answers, and so these names keep resolving while a tunnel
+# egress is down.
+#
+#   POLICY_local_EGRESS="direct"
+#   POLICY_local_DOMAINS="ru su xn--p1ai yandex.com vk.com mail.ru"
+#   POLICY_local_CIDRS="5.136.0.0/13 87.240.0.0/12"
+#   POLICY_local_DNS="77.88.8.8"
+#
+# Video comes second, so it overrides "local" for these names even though they
+# are .ru — exactly the last-match-wins mechanism.
+#
+#   POLICY_video_EGRESS="video"
+#   POLICY_video_DOMAINS="kinopoisk.ru kp.yandex.net rutube.ru strm.yandex.ru strm.yandex.net vh.yandex.ru vh.yandex.net"
+#
+# ...and this is why CIDRS exists. RuTube fronts its video through shared
+# anti-DDoS CDN ranges (AS51115 Qrator, AS201706 Servicepipe) whose addresses
+# are not always reachable under a *.rutube.ru name — so the player pulls
+# segments from hosts dnsmasq never saw resolved, and those segments take the
+# wrong egress while the page itself takes the right one. The symptom is a site
+# that loads but will not play. Pinning the ranges closes that gap:
+#
+#   POLICY_video_CIDRS="178.248.233.0/24 178.248.234.0/24 178.248.239.0/24 81.161.99.0/24 109.238.90.0/24"
+#
+# Seeds are static, so they age. Treat them as a supplement to domain matching,
+# never a replacement, and re-check them if a service starts misbehaving:
+#   whois -h whois.radb.net -- '-i origin AS51115' | grep ^route
+#
+# To find what a stubborn service is actually pulling from, watch what is NOT
+# landing in the set while you use it:
+#   tcpdump -ni in-family 'tcp port 443' | grep -vf <(ipset list gwpd_video | grep ^[0-9])
+
+
+# =============================================================================
+# DNS
+# =============================================================================
+# Chain: filter (AdGuardHome) -> dnsmasq -> dnscrypt-proxy (DoH).
+# Clients cannot opt out: :53 is redirected to the gateway whatever resolver
+# they configured, and DoT is rejected.
+DNS_STACK="yes"
+
+# Network-wide ad/tracker filtering with a web UI, reachable in-tunnel only.
+DNS_FILTER_ENABLE="yes"
+DNS_FILTER_VERSION="v0.107.68"
+DNS_FILTER_UI_PORT="80"
+
+# Which egress the gateway's own DNS queries take. Point this at a tunnel and
+# the network this box sits on can no longer see what your clients resolve —
+# the single most useful reason to add an exit server.
+DNS_EGRESS="direct"
+
+# DoH resolvers, by dnscrypt-proxy's names. Choose by measurement: these
+# queries traverse DNS_EGRESS, so a resolver close to you may be far from the
+# exit and slow every uncached lookup. See docs/TROUBLESHOOTING.md.
+DNSCRYPT_RESOLVERS="google quad9-doh-ip4-port443-filter-pri"
+
+# Plaintext fallback, used only if dnscrypt-proxy is down. Forced through
+# DNS_EGRESS so no plaintext DNS reaches the local uplink.
+DNS_FALLBACK="8.8.8.8"
+
+
+# =============================================================================
+# Safety
+# =============================================================================
+# Allowed through before any firewall policy is tightened.
+SSH_PORT="22"
+
+# Drop all IPv6 INPUT/FORWARD. Leave "no" unless you are certain you do not
+# reach this box over IPv6 — enabling it over an IPv6-only SSH session locks
+# you out.
+IPV6_HARDEN="no"
