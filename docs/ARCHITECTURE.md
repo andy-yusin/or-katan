@@ -65,7 +65,7 @@ POLICY_RULES="home stream"
 POLICY_home_EGRESS="direct"
 POLICY_home_DOMAINS="bank.example tax.gov.example"
 POLICY_stream_EGRESS="uk"
-POLICY_stream_DOMAINS="bbc.co.uk bbci.co.uk"
+POLICY_stream_DOMAINS="stream.example streamcdn.example"
 ```
 
 Each rule gets two ipsets: `gwp_<rule>` for the static CIDRs, and

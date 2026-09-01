@@ -102,13 +102,17 @@ POLICY_home_CIDRS=""
 POLICY_home_DNS="192.168.1.1"
 
 POLICY_stream_EGRESS="uk"
-POLICY_stream_DOMAINS="bbc.co.uk bbci.co.uk"
+POLICY_stream_DOMAINS="stream.example streamcdn.example"
 ```
 
-`DOMAINS` are matched as suffixes, so `bbc.co.uk` covers its subdomains and a
-bare TLD like `uk` would cover every name under it. As each name resolves,
-dnsmasq puts the answer in that rule's ipset and the routing follows — no CIDR
+`DOMAINS` are matched as suffixes, so `stream.example` covers its subdomains,
+and a bare TLD would cover every name under it. As each name resolves, dnsmasq
+puts the answer in that rule's ipset and the routing follows — no CIDR
 maintenance, and CDNs are covered.
+
+List the media origin alongside the site. A service usually serves its player
+from one name and its segments from another, often a different registrable
+domain entirely, and the second one is easy to miss.
 
 `POLICY_home_DNS` gives that rule its own resolver, pinned to the uplink. Your
 router knows your local names, returns better-located answers for anything that
@@ -129,7 +133,7 @@ The fix is to pin the ranges those addresses belong to:
 
 ```ini
 POLICY_stream_EGRESS="uk"
-POLICY_stream_DOMAINS="bbc.co.uk bbci.co.uk"
+POLICY_stream_DOMAINS="stream.example streamcdn.example"
 POLICY_stream_CIDRS="203.0.113.0/24 198.51.100.0/24"
 ```
 
@@ -213,7 +217,7 @@ POLICY_home_DNS="192.168.1.1"
 
 # stream is listed second, so it wins wherever both rules match
 POLICY_stream_EGRESS="uk"
-POLICY_stream_DOMAINS="bbc.co.uk bbci.co.uk"
+POLICY_stream_DOMAINS="stream.example streamcdn.example"
 POLICY_stream_CIDRS="203.0.113.0/24 198.51.100.0/24"
 ```
 

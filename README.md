@@ -47,7 +47,7 @@ Example — three groups, three ways out:
 | `friends` | AmneziaWG | yes — internet only | `main` |
 | `work` | WireGuard | no | `backup` |
 
-plus a rule sending `bbc.co.uk` out a `uk` path and your bank out `direct`,
+plus a rule sending `stream.example` out a `uk` path and your bank out `direct`,
 regardless of which channel asked.
 
 ## Two ingress protocols, on purpose

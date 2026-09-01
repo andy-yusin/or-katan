@@ -164,7 +164,7 @@ POLICY_RULES=""
 # something in "home" matched them too — the last-match-wins mechanism.
 #
 #   POLICY_stream_EGRESS="uk"
-#   POLICY_stream_DOMAINS="bbc.co.uk bbci.co.uk"
+#   POLICY_stream_DOMAINS="stream.example streamcdn.example"
 #
 # ...and this is why CIDRS exists. Plenty of services front their media through
 # shared CDN or anti-DDoS ranges, and the player then fetches segments from
