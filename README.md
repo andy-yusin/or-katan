@@ -1,4 +1,6 @@
-# gateway-kit
+# or-katan
+
+*אור קטן — "small light".*
 
 A self-hosted routing gateway: **named ingress channels** for who connects, and
 **named egress paths** for how their traffic leaves. You decide, per group and

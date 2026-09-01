@@ -15,7 +15,7 @@ country you want to appear from, or when you want the entry point and the exit
 address to be separable. The cost is a second machine, some latency, and one
 more thing that can break — `gw-egress set all direct` is the escape hatch.
 
-No part of gateway-kit runs on the exit. It is a plain WireGuard server, which
+No part of or-katan runs on the exit. It is a plain WireGuard server, which
 also means a commercial provider's config works just as well; skip to
 [Using a provider's config](#using-a-providers-config).
 

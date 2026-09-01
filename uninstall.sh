@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# uninstall.sh — remove gateway-kit.
+# uninstall.sh — remove or-katan.
 #
 # Stops every channel and egress tunnel, clears routing state, removes the
 # tools. Keys and client lists are kept unless you pass --purge: deleting them
@@ -86,7 +86,7 @@ fi
 step "Restoring DNS config"
 restored=0
 for f in /etc/dnsmasq.conf /etc/dnscrypt-proxy/dnscrypt-proxy.toml; do
-    backup="$(ls -1t "${f}".pre-gateway-kit* 2>/dev/null | head -1)"
+    backup="$(ls -1t "${f}".pre-or-katan* 2>/dev/null | head -1)"
     if [[ -n "$backup" ]]; then cp -a "$backup" "$f"; ok "restored $f"; restored=1; fi
 done
 [[ $restored -eq 0 ]] && warn "no pre-install DNS backups found; /etc/dnsmasq.conf still holds the kit's config"

@@ -1,5 +1,5 @@
 # =============================================================================
-# gateway-kit configuration
+# or-katan configuration
 # =============================================================================
 # A routing gateway with named ingress channels (who comes in, and under what
 # policy) and named egress paths (how their traffic leaves).
