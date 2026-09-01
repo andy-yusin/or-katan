@@ -113,18 +113,26 @@ In order, stopping at the first problem:
 4. **Kernel tuning** — IPv4 forwarding, reverse-path filtering set to loose
    (policy routing needs it), and IPv6 hardening if you asked for it.
 5. **Layout** — `/etc/gateway/` with the config, a copy of the kit, and the
-   `gw-*` tools in `/usr/local/bin`.
+   `gw-*` tools in `/usr/local/bin`. If the installed config and the one in the
+   clone differ, the more recently edited one wins — the tools write the
+   installed copy, so an old checkout cannot silently revert them.
 6. **Keys** — generated in `/etc/gateway/keys/` if absent. **Never rotated**, so
    re-running the installer never invalidates an issued client config.
 7. **Egress paths** — one interface per tunnel, with `Table = off` so wg-quick
    installs no route of its own; `gw-routes.sh` owns routing.
 8. **Ingress channels** — one interface per channel. Existing `[Peer]` blocks
-   are preserved, so clients survive.
+   are preserved, so clients survive. Each rendered config is compared against
+   the previous one; only what actually changed is backed up (three kept — they
+   hold private keys) and restarted.
 9. **DNS chain** — dnsmasq, dnscrypt-proxy, and AdGuardHome if enabled. The
    AdGuardHome download is checksum-verified.
 10. **Services** — systemd units, ordering drop-ins so upstreams come up before
     the channels that depend on them, and the guard against
-    `systemd-networkd` flushing policy rules.
+    `systemd-networkd` flushing policy rules. An interface whose config did not
+    change is not restarted: its routing is re-staged with `gw-routes.sh up`
+    instead, which disconnects nobody. Turning `DNS_FILTER_ENABLE` off also
+    stops and disables AdGuardHome here, before dnsmasq is asked to bind the
+    addresses it was holding.
 11. **Verification** — runs `gw-doctor`.
 
 It is safe to re-run at any time, and re-running is the normal way to apply a
@@ -173,8 +181,16 @@ cd or-katan && git pull
 sudo ./install.sh
 ```
 
-Keys, clients and your config survive. If a release changes the config schema,
-it says so in its notes.
+Keys, clients and your config survive. `gw-config`, `gw-egress` and applied
+profiles all write `/etc/gateway/gateway.conf`, not the copy in the clone, so
+the installer takes whichever of the two was edited last and says which one it
+used. To keep them in sync, copy the installed one back over the clone's:
+
+```bash
+sudo cp /etc/gateway/gateway.conf ./gateway.conf
+```
+
+If a release changes the config schema, it says so in its notes.
 
 ## Uninstalling
 
@@ -182,6 +198,9 @@ it says so in its notes.
 sudo ./uninstall.sh          # keeps keys and clients, so you can reinstall
 sudo ./uninstall.sh --purge  # deletes them; every issued config dies
 ```
+
+`--purge` also removes the timestamped `*.conf.bak-*` interface backups, which
+hold the same private keys as the configs themselves.
 
 ## When it goes wrong
 

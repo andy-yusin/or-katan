@@ -31,6 +31,11 @@ client. If your change can make a second run behave differently from the
 first, it is not finished — the idempotency check at the end of `test/run.sh`
 exists to catch exactly that.
 
+Re-running is also how every settings change is applied, so it must be cheap.
+An interface is restarted only when its own rendered config actually changed;
+anything that restarts unconditionally disconnects every client on the gateway
+each time someone edits an unrelated key.
+
 **Failures fail closed.** A dead tunnel egress must leave its routing table
 with no default route, so traffic assigned to it stops, rather than quietly
 falling back to the box's own uplink. Anything that could turn an outage into

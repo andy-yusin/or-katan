@@ -213,14 +213,20 @@ See [profiles/README.md](profiles/README.md).
 | `gw-egress set family backup` | move one channel, live |
 | `gw-egress set all direct` | move everything (e.g. an exit went down) |
 | `gw-egress add uk --endpoint …` | declare a new exit; generates a key if you omit one |
-| `gw-egress remove uk` | drop one nothing points at |
+| `gw-egress remove uk` | drop one nothing points at, unit and key included |
 | `gw-config` | the whole configuration, grouped |
 | `gw-config set DNS_FILTER_ENABLE no` | change one setting, validated and applied |
 | `gw-config profile ru` | swap the destination policy wholesale |
 | `gw-doctor` | check every layer |
 
-Anything that changes the config validates first and rolls back if the result
-would not install, so a typo cannot take the gateway down.
+Anything that changes the config validates first, and rolls back if *either*
+the validation or the apply is refused — so a typo cannot take the gateway
+down, and a change the gateway rejects is never left on disk describing a state
+it never reached.
+
+An apply restarts only the interfaces whose own configuration actually changed.
+Everything else is left connected and has its routing re-staged in place, so
+changing an unrelated setting does not cost anyone their session.
 
 Client configs land in `/etc/gateway/clients/`. They contain private keys — send
 them over something end-to-end encrypted and delete your copy afterwards.
@@ -245,7 +251,11 @@ sudo ./uninstall.sh            # keeps keys and clients
 sudo ./uninstall.sh --purge    # deletes them; every issued config dies
 ```
 
-To update, `git pull` and re-run `sudo ./install.sh`. Keys and clients survive.
+To update, `git pull` and re-run `sudo ./install.sh`. Keys, clients and your
+configuration all survive: `gw-config`, `gw-egress` and profiles write
+`/etc/gateway/gateway.conf`, and the installer uses whichever of that copy and
+the one in the clone was edited more recently — a stale checkout cannot revert
+work you did with the tools.
 
 ## Continuous integration
 

@@ -120,6 +120,54 @@ ip rule show | grep '^100:'    # exactly one line per channel
 
 ---
 
+## A config change says it was rolled back
+
+```
+ERROR: the change did not validate — config rolled back, nothing applied
+ERROR: the gateway refused the change — config rolled back.
+```
+
+Two different points of failure, and the difference matters.
+
+The first means the installer's validation rejected the new value: a duplicate
+port, a subnet that is not a `/24`, a channel pointing at an egress path that
+does not exist. Nothing was applied and nothing on the box moved.
+
+The second means the value was legal but the apply itself failed part-way — a
+service would not start, an interface would not come up. The file has been put
+back the way it was, but the *running* state may be half-changed, because the
+installer had already got as far as it did. The error above it names the step
+that failed. Fix that, then:
+
+```bash
+gw-config apply     # re-apply the restored config
+gw-doctor           # confirm every layer came back
+```
+
+Neither case leaves the config describing a state the gateway never reached,
+which is what makes `gw-config get` trustworthy after a failure.
+
+---
+
+## A gw-* tool says gw-lib.sh is missing
+
+```
+ERROR: gw-lib.sh not found (expected /etc/gateway/gw-lib.sh) — re-run install.sh
+```
+
+`gw-config` and `gw-egress` share their config writer, and it lives in
+`/etc/gateway/`. This means the tools in `/usr/local/bin` were updated without
+the installer being run — usually by copying them in by hand from a clone.
+
+```bash
+cd or-katan && sudo ./install.sh
+```
+
+Copying `gw-*` into `/usr/local/bin` yourself is never the supported path; the
+installer is what keeps `/etc/gateway/` and the tools on the same version.
+
+---
+
 ## Everything is slow, but nothing is broken
 
 Pages take seconds to *start* loading, then load fast. Every check passes.

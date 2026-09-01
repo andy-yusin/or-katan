@@ -152,7 +152,8 @@ Two fallbacks, neither putting plaintext DNS on the local network:
 
 With `DNS_FILTER_ENABLE="no"`, dnsmasq binds the channel gateway addresses on
 :53 itself — something has to answer there, since every client query is
-redirected to it.
+redirected to it. Applying that change also stops and disables AdGuardHome,
+which was holding those addresses; both cannot bind them at once.
 
 ### Choosing DoH resolvers
 
@@ -166,12 +167,14 @@ lookup for every client pays it. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 |---|---|
 | `/etc/gateway/gateway.conf` | the configuration every tool reads at runtime |
 | `/etc/gateway/gw-routes.sh` | routing/NAT/firewall, run from PostUp |
+| `/etc/gateway/gw-lib.sh` | the config writer, sourced by `gw-config` and `gw-egress` |
 | `/etc/gateway/keys/` | gateway private keys — never rotated by the installer |
 | `/etc/gateway/awg-params.conf` | this gateway's obfuscation signature |
 | `/etc/gateway/clients/` | issued client configs and QR images |
 | `/etc/wireguard/in-<channel>.conf` | a `wg` channel's interface + client list |
 | `/etc/amnezia/amneziawg/in-<channel>.conf` | an `awg` channel's interface + client list |
 | `/etc/wireguard/out-<egress>.conf` | a tunnel egress |
+| `*.conf.bak-<timestamp>` | the previous interface config, kept only when one actually changed; the last three survive. Private keys — treat them as live |
 
 `gw-routes.sh` is idempotent and safe to run by hand — it is the recovery path
 whenever routing state is flushed:

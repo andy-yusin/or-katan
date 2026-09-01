@@ -139,6 +139,14 @@ INGRESS_work_REACH=""
 #
 # Rules are evaluated in the order listed and THE LAST MATCH WINS, which is how
 # you carve a narrow exception out of a broad rule.
+#
+# `gw-config profile <name>` replaces this whole section. If you keep your
+# policy between the two marker lines below, it replaces exactly that and
+# leaves the rest of the file alone; setup.sh writes them for you.
+#
+#   # --- policy: begin (managed by gw-config profile) ---
+#   ...
+#   # --- policy: end ---
 POLICY_RULES=""
 
 # --- Worked example ----------------------------------------------------------
@@ -200,6 +208,8 @@ POLICY_RULES=""
 DNS_STACK="yes"
 
 # Network-wide ad/tracker filtering with a web UI, reachable in-tunnel only.
+# Switching this to "no" and re-applying stops and disables AdGuardHome, and
+# dnsmasq takes over :53 on the channel gateway addresses in its place.
 DNS_FILTER_ENABLE="yes"
 DNS_FILTER_VERSION="v0.107.68"
 DNS_FILTER_UI_PORT="80"
