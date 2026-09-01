@@ -6,12 +6,66 @@ A self-hosted routing gateway: **named ingress channels** for who connects, and
 **named egress paths** for how their traffic leaves. You decide, per group and
 per destination, which way out anything takes.
 
+## Quickstart
+
+Five minutes to a working gateway, on a fresh Ubuntu 24.04 or Debian 12 box you
+have root on. This path is single-hop — everything leaves through the box's own
+uplink — because that needs nothing you do not already have. Exits abroad,
+extra channels and destination policy all bolt on afterwards without disturbing
+anyone who is already connected.
+
+**1. Install.**
+
+```bash
+git clone https://github.com/andy-yusin/or-katan.git
+cd or-katan
+sudo ./setup.sh
 ```
-sudo ./install.sh
-gw-client add "moms-phone" --channel family    # prints a QR; scan it
-gw-egress                                      # where is everyone going out?
-gw-doctor                                      # check every layer
+
+Answer the questions or press enter through them. The defaults give you one
+channel called `family` on UDP 51820, filtered DNS, and no policy. It prints
+the ports to forward when it finishes.
+
+**2. Let clients reach it.** Open **UDP 51820** — in your VPS provider's
+firewall, or as a port forward on the router to this box's LAN address. This is
+the step people forget, and the symptom is a client that never handshakes.
+
+**3. Add someone.**
+
+```bash
+sudo gw-client add "moms-phone" --channel family
 ```
+
+A QR code is printed. Scan it with the **WireGuard** app — or the **AmneziaWG**
+app if you chose an `awg` channel; the two are not interchangeable.
+
+**4. Check it.**
+
+```bash
+gw-doctor        # every layer, in order — the first failure is the real one
+gw-egress test   # asks the kernel where each channel's traffic actually goes
+```
+
+`gw-egress test` is the one that matters: it catches a leak that a working
+internet connection would otherwise hide.
+
+### Then, when you want more
+
+```bash
+sudo gw-egress add uk --endpoint <host>:<port> --pubkey <key> --address 10.2.0.2/24
+sudo gw-config apply                  # bring the new exit up
+sudo gw-egress set family uk          # send a channel through it, live
+
+sudo gw-config profile split-home     # route some destinations differently
+sudo gw-client add "laptop" --channel work
+```
+
+`gw-egress add` generates this gateway's key pair if you do not supply one, and
+prints the `[Peer]` block to paste into the exit server. Standing one up is
+about fifteen lines: [docs/EXIT-SERVER.md](docs/EXIT-SERVER.md).
+
+Full prerequisites — kernel versions, CGNAT, containers, what each installer
+step does: [docs/INSTALL.md](docs/INSTALL.md).
 
 ## What it is for
 
@@ -108,25 +162,26 @@ see what your clients look up.
   baked into every client config, so you can move the box and clients follow.
 - One open UDP port per ingress channel.
 
-## Install
+Kernel versions, the CGNAT case, containers, and what each installer step does:
+[docs/INSTALL.md](docs/INSTALL.md).
+
+## Configuring it by hand
+
+`setup.sh` is a front end for one file. To skip it, start from
+`gateway.conf.example` — it documents every setting — and run the installer
+yourself:
 
 ```bash
-git clone https://github.com/andy-yusin/or-katan.git
-cd or-katan
-sudo ./setup.sh
+cp gateway.conf.example gateway.conf
+$EDITOR gateway.conf
+sudo ./install.sh --check-only    # validate without changing anything
+sudo ./install.sh
 ```
 
-`setup.sh` asks what you want, writes `gateway.conf`, and offers to install.
-Every question has a default and nothing is written until the end. To write the
-config by hand instead, start from `gateway.conf.example` and run
-`sudo ./install.sh`.
-
-The installer validates the whole config before touching anything — duplicate
-ports, overlapping subnets, channels pointing at egress paths that do not exist.
-Re-run it after any change: it never rotates keys and never drops clients.
-
-Full prerequisites, what the installer does step by step, and how to verify it
-worked: [docs/INSTALL.md](docs/INSTALL.md).
+The installer validates the whole config before touching anything: duplicate
+ports, overlapping subnets, channels pointing at egress paths that do not
+exist. Re-running it is the normal way to apply a change — it never rotates
+keys and never drops clients.
 
 ### Profiles
 
