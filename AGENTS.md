@@ -138,6 +138,12 @@ is why channel and egress names must match `^[a-z][a-z0-9_]*$`.
   line — silently, in a way that still validates. Config writes go through
   `conf_set` in `files/gw-lib.sh`, which escapes them; do not hand-roll another
   `sed -i "s|^KEY=.*|KEY=$value|"`.
+- **dnsmasq's `bind-dynamic` device-binds every listener.** A packet arriving on
+  one interface never reaches a socket bound to another, whatever its
+  destination address says — so DNAT'ing a query to an address dnsmasq listens
+  on black-holes it unless dnsmasq also has the arrival interface. AdGuardHome
+  binds addresses only and has no such rule, which is why `DNS_LAN_CLIENTS`
+  installs a redirect for one and an extra listener for the other.
 - **`systemd-networkd` restarts flush foreign policy rules.** Guarded by a
   drop-in the installer writes; if rules vanish after an apt upgrade, that is
   why. Recovery is `gw-routes.sh up <channel>`.

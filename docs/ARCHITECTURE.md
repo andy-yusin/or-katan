@@ -155,6 +155,39 @@ With `DNS_FILTER_ENABLE="no"`, dnsmasq binds the channel gateway addresses on
 redirected to it. Applying that change also stops and disables AdGuardHome,
 which was holding those addresses; both cannot bind them at once.
 
+### Serving the uplink side
+
+Everything above applies to tunnelled clients, whose queries are redirected
+because they arrive on a channel interface. A router on the same LAN as the
+gateway has no tunnel, so nothing redirects it — and the resolver binds only
+loopback and the channel gateway addresses, which the LAN cannot reach.
+
+`DNS_LAN_CLIENTS` lists the source ranges allowed to close that gap. What it
+installs depends on which resolver is answering, because the two behave
+differently:
+
+- **AdGuardHome** binds addresses and nothing else, so the query is redirected:
+  its destination is rewritten to a channel gateway address the filter already
+  answers on. `AdGuardHome.yaml` is untouched — the installer stops owning that
+  file once it exists, so a bind-address setting would silently do nothing on
+  every box that already had AdGuard, which is every box that matters.
+- **dnsmasq** (`DNS_FILTER_ENABLE="no"`) uses `bind-dynamic`, which device-binds
+  each listener. A packet arriving on the uplink never reaches a socket bound to
+  a channel interface, whatever its destination says, so redirecting it would
+  black-hole it. There the installer gives dnsmasq the uplink interface and the
+  query is left alone.
+
+Either way the same pair of firewall rules scopes it: the listed sources are
+accepted on :53 from the uplink and everything else on :53 from the uplink is
+dropped, rather than left to the INPUT policy. That matters most in the dnsmasq
+shape, where a resolver really is bound to the uplink address — the drop is what
+keeps it from being an open resolver for whatever the uplink is attached to.
+`install.sh` refuses `0.0.0.0/0` outright and warns on anything outside private
+space.
+
+The rules live in their own `GW_LAN_DNS` chain, so emptying the setting
+converges to no rules without needing to know the previous value.
+
 ### Choosing DoH resolvers
 
 By measurement, not reputation. These queries leave via `DNS_EGRESS`, so a

@@ -228,6 +228,19 @@ DNSCRYPT_RESOLVERS="google quad9-doh-ip4-port443-filter-pri"
 # DNS_EGRESS so no plaintext DNS reaches the local uplink.
 DNS_FALLBACK="8.8.8.8"
 
+# Machines on the uplink side allowed to use this gateway as their resolver —
+# typically the router, forwarding DNS for a whole house. They have no tunnel,
+# so nothing redirects their queries and the resolver is not listening on the
+# uplink address. Listing a range here fixes both ends of that, and drops
+# everything else that asks this box for DNS over the uplink.
+#
+# Space-separated addresses or CIDRs, and they must be narrow: anything that
+# can reach the uplink and is listed here can resolve through this box. On a
+# VPS with a public uplink, leave it empty. 0.0.0.0/0 is refused outright.
+#
+#   DNS_LAN_CLIENTS="192.168.1.0/24"
+DNS_LAN_CLIENTS=""
+
 
 # =============================================================================
 # Safety

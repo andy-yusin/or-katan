@@ -13,9 +13,16 @@
 # dnsmasq is itself the client-facing resolver and binds the channel gateway
 # addresses on :53. bind-dynamic, not bind-interfaces, so it can bind addresses
 # that only appear when the ingress interfaces come up.
+#
+# An interface= line below means DNS_LAN_CLIENTS is set and dnsmasq is the one
+# answering: bind-dynamic device-binds each listener, so a query arriving on the
+# uplink cannot be redirected to a channel address the way it can when
+# AdGuardHome is in front — dnsmasq has to hold the uplink address itself. The
+# firewall, not this file, is what limits who may ask.
 listen-address=@DNSMASQ_LISTEN@
 port=@DNSMASQ_PORT@
 bind-dynamic
+@DNSMASQ_UPLINK_LINE@
 
 # --- Upstreams ---
 no-resolv

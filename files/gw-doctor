@@ -22,7 +22,7 @@ section() { printf '\n%s== %s ==%s\n' "$CYAN" "$1" "$NC"; }
 source "$CONF_FILE"
 : "${INGRESS_CHANNELS:=}"; : "${EGRESS_PATHS:=direct}"; : "${POLICY_RULES:=}"
 : "${DNS_STACK:=yes}"; : "${DNS_FILTER_ENABLE:=yes}"; : "${GATEWAY_HOST:=}"
-: "${DNS_EGRESS:=}"
+: "${DNS_EGRESS:=}"; : "${DNS_LAN_CLIENTS:=}"
 
 DEF_IF="$(ip route show default | awk '/default/ {print $5; exit}')"
 cfg() { local v="$1"; echo "${!v-}"; }
@@ -220,6 +220,33 @@ if command -v dig >/dev/null; then
     done
 else
     warn "dig not installed, skipping resolution checks" "apt install dnsutils"
+fi
+
+# LAN clients arrive on the uplink, not on a channel, so the per-channel checks
+# above passing says nothing about whether they can resolve.
+if [[ -n "$DNS_LAN_CLIENTS" ]]; then
+    if iptables -S GW_LAN_DNS 2>/dev/null | grep -q -- '--dport 53 -j ACCEPT'; then
+        pass "LAN DNS: ${DNS_LAN_CLIENTS} allowed on ${DEF_IF}"
+    else
+        fail "LAN DNS: ${DNS_LAN_CLIENTS} is configured but no rules are installed" \
+             "/etc/gateway/gw-routes.sh up <channel>"
+    fi
+    # With the filter answering, the query is redirected to an address it binds.
+    # With dnsmasq answering, it is left alone and dnsmasq holds the uplink —
+    # bind-dynamic device-binds its sockets, so a redirect there would black-hole.
+    if [[ "$DNS_FILTER_ENABLE" == "yes" ]]; then
+        iptables -t nat -S GW_LAN_DNS 2>/dev/null | grep -q -- '--dport 53' \
+            && pass "LAN DNS: redirected to the filter" \
+            || fail "LAN DNS: no redirect — queries reach nothing on ${DEF_IF}" \
+                    "/etc/gateway/gw-routes.sh up <channel>"
+    else
+        uplink_ip="$(ip -4 -br addr show dev "$DEF_IF" 2>/dev/null | awk '{print $3}' | cut -d/ -f1)"
+        if ss -lnup 2>/dev/null | grep -qF "${uplink_ip}:53"; then
+            pass "LAN DNS: dnsmasq listens on ${uplink_ip}:53"
+        else
+            fail "LAN DNS: nothing listens on ${uplink_ip}:53" "re-run install.sh, then check dnsmasq"
+        fi
+    fi
 fi
 fi
 

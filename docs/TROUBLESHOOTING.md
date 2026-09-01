@@ -294,6 +294,52 @@ user_rules:
 
 ---
 
+## The LAN router forwards DNS here and nothing resolves
+
+The resolver binds loopback and the channel gateway addresses. It does not bind
+the uplink address, so a router forwarding to this box's LAN address has nothing
+to talk to. Name the ranges allowed to use it:
+
+```bash
+gw-config set DNS_LAN_CLIENTS "192.168.1.0/24"
+```
+
+Check it landed:
+
+```bash
+gw-doctor | grep "LAN DNS"
+iptables -S GW_LAN_DNS
+```
+
+Two PASS lines, and the second one differs by resolver — with the filter on the
+query is redirected to an address AdGuardHome binds, and with it off dnsmasq
+holds the uplink address itself. Then from a LAN machine — the answer must come
+back, and a known-blocked name must come back as `0.0.0.0`, which proves the
+filter is answering rather than something upstream:
+
+```bash
+dig @<gateway-lan-ip> example.com +short
+dig @<gateway-lan-ip> doubleclick.net +short
+```
+
+Still nothing:
+
+- **Queries never arrive.** Many home routers race every resolver they know and
+  answer from whichever replies first, so removing their other DNS, DoH and DoT
+  entries is what actually forces traffic here. `tcpdump -ni <uplink> port 53`
+  says whether anything arrives at all.
+- **The range is not the one the router sends from.** The rules match on source,
+  and the router's own address may be outside the range you listed. Everything
+  on :53 from the uplink that is not listed is dropped, so a near miss looks
+  exactly like a dead resolver.
+- **`ip route get` shows the LAN range leaving through a tunnel.** The reply has
+  to go back the way it came. Route the LAN range direct.
+
+`gw-doctor` reports the rules as present or missing; it cannot test the path
+from the LAN, so do the two `dig`s above after any change.
+
+---
+
 ## Large transfers stall, small requests are fine
 
 An MTU problem: something on the path is dropping the ICMP messages that

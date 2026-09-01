@@ -52,6 +52,8 @@ source "$CONF_FILE"
 : "${POLICY_RULES:=}"
 : "${DNS_EGRESS:=}"
 : "${DNS_FALLBACK:=}"
+: "${DNS_LAN_CLIENTS:=}"
+: "${DNS_FILTER_ENABLE:=yes}"
 : "${IPV6_HARDEN:=no}"
 : "${SSH_PORT:=22}"
 
@@ -141,6 +143,94 @@ count_other_channels() {
 }
 
 # =============================================================================
+# LAN clients using this gateway as their resolver
+# =============================================================================
+# A machine on the uplink side — typically the router, forwarding DNS for a
+# whole house — has no tunnel, so nothing redirects its queries the way the
+# per-channel rules do, and the resolver is not listening on the uplink address.
+#
+# Two shapes, because the two resolvers behave differently:
+#
+#   AdGuardHome binds addresses only, so a query can be redirected to one of the
+#   channel gateway addresses it already answers on. Nothing in
+#   AdGuardHome.yaml changes — the installer stops owning that file once it
+#   exists, so a bind-address setting would silently do nothing on every box
+#   that already had AdGuard.
+#
+#   dnsmasq (DNS_FILTER_ENABLE="no") uses bind-dynamic, which device-binds each
+#   listener: a packet arriving on the uplink never reaches a socket bound to a
+#   channel address, whatever its destination says. Redirecting it drops it.
+#   There install.sh gives dnsmasq the uplink interface and the query is left
+#   alone — the ACCEPT/DROP pair below is what scopes it.
+#
+# The rules live in their own chain so that emptying DNS_LAN_CLIENTS converges
+# to "no rules" without having to know what the previous value was.
+LAN_DNS_CHAIN="GW_LAN_DNS"
+
+lan_dns() {
+    local tbl
+    for tbl in nat filter; do
+        iptables -t "$tbl" -N "$LAN_DNS_CHAIN" 2>/dev/null || true
+        iptables -t "$tbl" -F "$LAN_DNS_CHAIN"
+    done
+    ipt_insert_once nat    PREROUTING -j "$LAN_DNS_CHAIN"
+    ipt_insert_once filter INPUT      -j "$LAN_DNS_CHAIN"
+
+    # Nothing configured: leave the chain empty rather than starting to drop
+    # port 53 on a box whose operator never asked us to serve or block it.
+    [[ -n "$DNS_LAN_CLIENTS" ]] || { log "LAN DNS: none configured"; return 0; }
+
+    local target="" cidr proto
+    if [[ "$DNS_FILTER_ENABLE" != "no" ]]; then
+        # Any channel gateway address will do — the filter binds all of them —
+        # but it has to be one that is actually assigned, or the rewritten
+        # packet gets routed instead of delivered locally. Prefer a channel that
+        # is up, falling back to the first configured one so the rules are in
+        # place for when it comes up.
+        local c
+        for c in $INGRESS_CHANNELS; do
+            [[ -n "$target" ]] || target="$(net_gw "$(ch_net "$c")")"
+            if ip link show dev "$(ch_iface "$c")" &>/dev/null; then
+                target="$(net_gw "$(ch_net "$c")")"
+                break
+            fi
+        done
+        [[ -n "$target" ]] || { log "WARN: no ingress channel to point LAN DNS at; skipping"; return 0; }
+    fi
+
+    for cidr in $DNS_LAN_CLIENTS; do
+        for proto in udp tcp; do
+            if [[ -n "$target" ]]; then
+                iptables -t nat -A "$LAN_DNS_CHAIN" -i "$DEF_IF" -s "$cidr" \
+                    -p "$proto" --dport 53 -j DNAT --to-destination "$target"
+            fi
+            iptables -t filter -A "$LAN_DNS_CHAIN" -i "$DEF_IF" -s "$cidr" \
+                -p "$proto" --dport 53 -j ACCEPT
+        done
+    done
+    # Everything else arriving on the uplink for :53 is refused here rather than
+    # left to the INPUT policy, so the scope holds even where that policy is
+    # ACCEPT. Without it, the dnsmasq shape above would be an open resolver for
+    # whatever the uplink is attached to.
+    for proto in udp tcp; do
+        iptables -t filter -A "$LAN_DNS_CHAIN" -i "$DEF_IF" -p "$proto" --dport 53 -j DROP
+    done
+    log "LAN DNS: ${DNS_LAN_CLIENTS} on ${DEF_IF}${target:+ -> ${target}:53}"
+    return 0
+}
+
+lan_dns_teardown() {
+    ipt_delete_all nat    PREROUTING -j "$LAN_DNS_CHAIN"
+    ipt_delete_all filter INPUT      -j "$LAN_DNS_CHAIN"
+    local tbl
+    for tbl in nat filter; do
+        iptables -t "$tbl" -F "$LAN_DNS_CHAIN" 2>/dev/null || true
+        iptables -t "$tbl" -X "$LAN_DNS_CHAIN" 2>/dev/null || true
+    done
+    return 0
+}
+
+# =============================================================================
 # Global state — shared by every channel
 # =============================================================================
 ensure_global() {
@@ -203,6 +293,7 @@ ensure_global() {
     ipt_append_once mangle FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
     host_dns_egress
+    lan_dns
     listen_ports_open
 
     if [[ "$IPV6_HARDEN" == "yes" ]]; then
@@ -295,6 +386,7 @@ teardown_global() {
     done
     ip route flush table "$TBL_LOCAL" 2>/dev/null || true
     ipt_delete_all mangle FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    lan_dns_teardown
     for fb in $DNS_FALLBACK; do
         ipt_delete_all mangle OUTPUT -d "$fb" -p udp --dport 53 -j MARK --set-mark "$(eg_mark "$(default_egress)")/${MARK_MASK}"
         ipt_delete_all mangle OUTPUT -d "$fb" -p tcp --dport 53 -j MARK --set-mark "$(eg_mark "$(default_egress)")/${MARK_MASK}"

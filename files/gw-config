@@ -242,7 +242,7 @@ show_all() {
     done
     echo
     echo "${CYAN}${BOLD}dns${NC}"
-    for k in DNS_STACK DNS_FILTER_ENABLE DNS_EGRESS DNSCRYPT_RESOLVERS DNS_FALLBACK; do
+    for k in DNS_STACK DNS_FILTER_ENABLE DNS_EGRESS DNSCRYPT_RESOLVERS DNS_FALLBACK DNS_LAN_CLIENTS; do
         printf '  %-24s %s\n' "$k" "$(conf_get "$k" 2>/dev/null || echo "${DIM}default${NC}")"
     done
 }

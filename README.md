@@ -161,6 +161,10 @@ a hardcoded resolver still gets yours. Upstream is DoH via dnscrypt-proxy,
 routed out whichever egress you choose, so the network this box sits on cannot
 see what your clients look up.
 
+Devices that never connect to a channel can use it too: point the LAN router's
+DNS at the gateway and list its range in `DNS_LAN_CLIENTS`, and everything in
+the house is filtered without installing anything on it.
+
 ## Requirements
 
 - Ubuntu 22.04/24.04 or Debian 12, root access. A 1-core / 512 MB VPS is plenty.
