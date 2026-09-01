@@ -20,6 +20,7 @@ else: channels, egress paths, keys and clients are left alone.
 |---|---|
 | `none` | No policy at all. Every channel uses its default egress for everything. |
 | `split-home` | Banks, tax portals and work intranets go out your own uplink; everything else takes the tunnel. Domains are placeholders — fill in yours. |
+| `dev` | One egress per project VPN, each project's hosts routed to its own. For working against several customer or staging networks at once. |
 | `ru` | Russian segment: domestic services on the local uplink, video out a dedicated in-country exit, obfuscated ingress. |
 
 `ru` is the only region-specific profile here, because it is the only one whose

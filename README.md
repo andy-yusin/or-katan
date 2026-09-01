@@ -13,6 +13,32 @@ gw-egress                                      # where is everyone going out?
 gw-doctor                                      # check every layer
 ```
 
+## What it is for
+
+A hub where many connections meet and each one is routed deliberately. Three
+shapes come up over and over:
+
+**Several VPNs at once, on one box.** Three customers, three VPNs, and a laptop
+that can only hold one at a time. Terminate all of them on the gateway and route
+by destination instead: project A's staging and project B's git are reachable
+simultaneously, from every machine behind it, with nothing to toggle. The `dev`
+profile is this shape.
+
+**A small office or team.** One channel per group — staff, contractors, lab
+gear, personal devices. Each gets its own subnet, its own default exit, and its
+own isolation rules, so contractors reach the internet and nothing else while
+staff reach the printer. Revoking a group is one channel, not a rebuild.
+
+**A household.** Phones and laptops on an obfuscated channel, guests isolated,
+IoT devices on their own channel that can talk to the internet and to nothing of
+yours. Filtered DNS for everyone, with the things that should see your own
+address — bank, tax portal — sent straight out.
+
+What they have in common: more than one way in, more than one way out, and a
+decision about which pairs with which. If that is the problem, this is the tool.
+If you want one tunnel for one person, plain WireGuard is simpler and you should
+use it.
+
 ## The model
 
 ```
@@ -149,6 +175,7 @@ each other by name.
 - [docs/EXIT-SERVER.md](docs/EXIT-SERVER.md) — standing up a tunnel egress
 - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — the failure modes worth knowing in advance
 - [profiles/README.md](profiles/README.md) — ready-made destination policies
+- [AGENTS.md](AGENTS.md) — the map, if you are pointing an assistant at this repo
 
 ## Uninstall
 

@@ -36,6 +36,29 @@ a silent leak is a bug, however convenient it is.
 check that tells someone it is broken. The whole point is that the person
 running this can diagnose it without reading the source.
 
+**It has to be legible to a language model, not just to you.** People will
+point an assistant at this repo and ask it to add a channel, debug a leak, or
+explain why their traffic is going the wrong way. A model that has to guess
+will guess confidently and wrongly, and someone's gateway will be misconfigured
+because of it. So:
+
+- **Say why, next to the thing.** A model reading `ip rule add ... priority 10`
+  cannot recover the reason that number is 10. The comment above it is the only
+  place that information exists.
+- **Name the invariant when you rely on it.** "Rules are appended in
+  `POLICY_RULES` order so the last match wins" is load-bearing; anything that
+  reorders them breaks the design silently. Write it down where it is relied on.
+- **Keep [AGENTS.md](AGENTS.md) true.** It is the map an assistant reads first.
+  If you move a file, add a tool, or change what a config key means, update it
+  in the same commit — a stale map is worse than none.
+- **Document failure modes, not just usage.** What breaks, what it looks like
+  when it breaks, and what to check. [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
+  is more valuable to an assistant than the reference sections, because it maps
+  symptoms to causes and that is what people actually ask about.
+- **Prefer explicit over clever.** An obvious twenty lines beat a dense five.
+  Both a newcomer and a model read this the same way: linearly, without the
+  context you have in your head right now.
+
 ## Style
 
 Bash, `set -euo pipefail`, shellcheck-clean at `-S warning`.
