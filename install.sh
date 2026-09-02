@@ -63,6 +63,9 @@ source "$CONF_SRC"
 : "${DNS_FILTER_UI_PORT:=80}"; : "${DNS_EGRESS:=}"; : "${DNS_FALLBACK:=8.8.8.8}"
 : "${DNSCRYPT_RESOLVERS:=google}"; : "${SSH_PORT:=22}"; : "${IPV6_HARDEN:=no}"
 : "${DNS_LAN_CLIENTS:=}"; : "${POLICY_FEED_SCHEDULE:=daily}"
+: "${HEALTH_TARGETS:=https://1.1.1.1 https://8.8.8.8}"; : "${HEALTH_INTERVAL:=30}"
+: "${HEALTH_TIMEOUT:=5}"; : "${HEALTH_THRESHOLD:=2}"; : "${HEALTH_COOLDOWN:=120}"
+: "${HEALTH_FAILBACK:=no}"
 
 cfg() { local v="$1"; echo "${!v-}"; }
 ch_type()  { local t; t="$(cfg "INGRESS_${1}_TYPE")"; echo "${t:-wg}"; }
@@ -157,6 +160,42 @@ sched_re='^[A-Za-z0-9:*,/. -]+$'
     || die "POLICY_FEED_SCHEDULE is not a systemd OnCalendar expression"
 [[ -z "$DNS_EGRESS" || " ${EGRESS_PATHS} " == *" ${DNS_EGRESS} "* ]] \
     || die "DNS_EGRESS '${DNS_EGRESS}' is not a declared egress"
+
+# An egress that names somewhere to fail over to is one gw-health watches. The
+# list is ordered: the first candidate that answers takes the traffic.
+FAILOVER_EGRESSES=""
+for e in $EGRESS_PATHS; do
+    fo="$(cfg "EGRESS_${e}_FAILOVER")"
+    [[ -n "$fo" ]] || continue
+    for f in $fo; do
+        [[ " ${EGRESS_PATHS} " == *" ${f} "* ]] \
+            || die "EGRESS_${e}_FAILOVER names undeclared egress '${f}'"
+        [[ "$f" != "$e" ]] || die "EGRESS_${e}_FAILOVER lists '${e}' itself — a path cannot stand in for itself"
+        # Allowed, because connectivity is sometimes worth more than the exit.
+        # Said out loud, because the failure it produces is invisible from the
+        # client side: everything still works, from this gateway's own address.
+        [[ "$(eg_type "$f")" == "direct" ]] \
+            && warn "EGRESS_${e}_FAILOVER falls back to 'direct' — when ${e} fails its clients egress from this gateway's own address, not a tunnel"
+    done
+    FAILOVER_EGRESSES="${FAILOVER_EGRESSES}${FAILOVER_EGRESSES:+ }${e}"
+done
+for k in HEALTH_INTERVAL HEALTH_TIMEOUT HEALTH_THRESHOLD HEALTH_COOLDOWN; do
+    v="$(cfg "$k")"
+    [[ "$v" =~ ^[0-9]+$ && "$v" -gt 0 ]] || die "${k} must be a positive number, got '${v}'"
+done
+[[ "$HEALTH_FAILBACK" =~ ^(yes|no)$ ]] || die "HEALTH_FAILBACK must be 'yes' or 'no'"
+for u in $HEALTH_TARGETS; do
+    [[ "$u" =~ ^https?://[^[:space:]]+$ ]] || die "HEALTH_TARGETS entry '${u}' must be an http or https URL"
+done
+if [[ -n "$FAILOVER_EGRESSES" ]]; then
+    # One check probes each watched path and then its candidates, and every
+    # probe can burn HEALTH_TIMEOUT per target before giving up. If that can
+    # outrun the interval, checks pile up behind the lock and the interval
+    # written here stops being the one in effect.
+    worst=$(( $(wc -w <<< "$EGRESS_PATHS") * $(wc -w <<< "$HEALTH_TARGETS") * HEALTH_TIMEOUT ))
+    [[ "$worst" -le "$HEALTH_INTERVAL" ]] \
+        || warn "a slow check can take ${worst}s but HEALTH_INTERVAL is ${HEALTH_INTERVAL}s — raise the interval or lower HEALTH_TIMEOUT"
+fi
 
 # Serving DNS to the uplink side is useful and sharp-edged in equal measure:
 # scoped to the LAN it is a house-wide filtered resolver, unscoped it is an
@@ -288,8 +327,9 @@ install -m 755 "${KIT_DIR}/files/gw-egress" /usr/local/bin/gw-egress
 install -m 755 "${KIT_DIR}/files/gw-doctor" /usr/local/bin/gw-doctor
 install -m 755 "${KIT_DIR}/files/gw-config" /usr/local/bin/gw-config
 install -m 755 "${KIT_DIR}/files/gw-feeds" /usr/local/bin/gw-feeds
+install -m 755 "${KIT_DIR}/files/gw-health" /usr/local/bin/gw-health
 install -m 755 "${KIT_DIR}/setup.sh" /usr/local/bin/gw-setup
-ok "config at ${CONF_DST}; tools: gw-client, gw-egress, gw-config, gw-doctor, gw-feeds, gw-setup"
+ok "config at ${CONF_DST}; tools: gw-client, gw-egress, gw-config, gw-doctor, gw-feeds, gw-health, gw-setup"
 
 # Keys live outside the interface configs so re-running the installer never
 # rotates them — that would silently invalidate every client config ever issued.
@@ -798,6 +838,47 @@ for c in $INGRESS_CHANNELS; do
 done
 if [[ "$DNS_FILTER_ENABLE" == "yes" ]]; then
     start_unit AdGuardHome; ok "DNS filter up"
+fi
+
+# --- Egress health checks ----------------------------------------------------
+# Last, after the tunnels are up: the first check runs as soon as the timer is
+# enabled, and one that ran while they were still coming up would probe a set
+# of paths that are all legitimately down.
+if [[ -n "$FAILOVER_EGRESSES" ]]; then
+    cat > /etc/systemd/system/gw-health.service <<'EOF'
+[Unit]
+Description=Probe each egress path and carry the failed ones on another
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/gw-health check
+EOF
+    cat > /etc/systemd/system/gw-health.timer <<EOF
+[Unit]
+Description=Egress health check (every ${HEALTH_INTERVAL}s)
+
+[Timer]
+# Late enough that the tunnels have had their own chance to come up. A check
+# before then finds every path down and has nowhere to fail over to.
+OnBootSec=45
+OnUnitActiveSec=${HEALTH_INTERVAL}
+# systemd's default accuracy is a minute, which would quietly round any
+# interval shorter than that into something else.
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now gw-health.timer >/dev/null 2>&1 || true
+    ok "egress failover: ${FAILOVER_EGRESSES} (checked every ${HEALTH_INTERVAL}s)"
+elif [[ -f /etc/systemd/system/gw-health.timer ]]; then
+    systemctl disable --now gw-health.timer >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/gw-health.timer /etc/systemd/system/gw-health.service
+    systemctl daemon-reload
+    ok "egress failover: none configured, timer removed"
 fi
 
 # =============================================================================

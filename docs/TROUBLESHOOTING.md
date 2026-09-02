@@ -269,6 +269,35 @@ gw-egress set all main        # back when it returns
 Only the channels using that path are affected; channels on other paths keep
 working.
 
+If `EGRESS_<path>_FAILOVER` names somewhere for it to go, this happens without
+you: the path is probed every `HEALTH_INTERVAL` seconds and its traffic moves
+to the first listed path that answers.
+
+```bash
+gw-health                     # what is answering, and what is standing in
+journalctl -u gw-health       # when it moved, and why
+```
+
+What moved is one route — the default in that path's own table — so the
+channels, policy rules and gateway DNS pointed at it all followed, nobody was
+disconnected, and `gateway.conf` still says what you meant.
+
+It does not move back on its own. A path that failed once usually flaps, and
+each flap changes the apparent location of every client on it, so `gw-doctor`
+tells you when the original is answering again and you decide:
+
+```bash
+gw-health back main           # return it; gw-health back all for every path
+```
+
+Set `HEALTH_FAILBACK="yes"` if you would rather it returned by itself.
+
+**A failover that never fires.** `gw-health.timer` has to be enabled
+(`gw-doctor` checks), the failed path needs `EGRESS_<path>_FAILOVER`, and the
+candidates have to answer a probe themselves — a check where nothing is healthy
+deliberately changes nothing rather than moving traffic somewhere that also
+does not work. `gw-health` shows all three at once.
+
 ---
 
 ## DNS rule changes do not take effect

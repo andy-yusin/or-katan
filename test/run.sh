@@ -114,6 +114,50 @@ if grep -q "^POLICY_[a-z_]*_FEED=" /work/gateway.conf; then
     gw-config --no-apply set "POLICY_${fr}_FEED" "file:///work/test/fixtures/policy-feed.list" >/dev/null 2>&1 || true
 fi
 
+# Only the fixtures that give a path somewhere to go exercise this.
+if grep -q "^EGRESS_[a-z_]*_FAILOVER=" /work/gateway.conf; then
+    echo
+    echo "==> egress failover"
+    fe=$(grep -oE "^EGRESS_[a-z_]+_FAILOVER=" /work/gateway.conf | sed -E "s/^EGRESS_(.*)_FAILOVER=$/\1/" | head -1)
+    fb=$(. /work/gateway.conf; eval "echo \$EGRESS_${fe}_FAILOVER" | awk '{print $1}')
+    tbl="gw_${fe}"
+    if [ "$fb" = "direct" ]; then
+        want=$(ip route show default | awk '{print $5; exit}')
+    else
+        want="out-${fb}"
+    fi
+    table_dev() { ip route show table "$1" 2>/dev/null \
+        | awk '/default/{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}'; }
+
+    # Nothing in here answers a probe, so two checks — enough to cross the
+    # threshold and scan the candidates — must still change nothing.
+    gw-health check >/dev/null 2>&1 || true
+    gw-health check >/dev/null 2>&1 || true
+    [ -z "$(gw-health substitutions)" ] \
+        && echo "  no substitute is invented when nothing is healthy" \
+        || echo "  HEALTH BROKEN: failed over to a path that never answered"
+
+    # The mechanism itself, driven by hand: one route moves and everything
+    # pointed at that path follows it.
+    gw-health switch "$fe" "$fb" >/dev/null 2>&1 || true
+    d=$(table_dev "$tbl")
+    [ "$d" = "$want" ] && echo "  ${tbl} follows the substitution to ${want}" \
+                       || echo "  HEALTH BROKEN: ${tbl} points at ${d:-nothing}, expected ${want}"
+    dr=$(gw-doctor 2>&1 || true)
+    if echo "$dr" | grep -aq "LEAKING"; then
+        echo "  HEALTH BROKEN: gw-doctor reads a live failover as a leak"
+    elif echo "$dr" | grep -aq "carried by"; then
+        echo "  gw-doctor reports the failover rather than a leak"
+    else
+        echo "  HEALTH BROKEN: gw-doctor says nothing about a failover in force"
+    fi
+
+    gw-health back "$fe" >/dev/null 2>&1 || true
+    d=$(table_dev "$tbl")
+    [ "$d" = "out-${fe}" ] && echo "  back on its own path after 'gw-health back'" \
+                           || echo "  HEALTH BROKEN: after 'back', ${tbl} points at ${d:-nothing}"
+fi
+
 echo
 echo "==> idempotency: install again, rule counts must not move"
 before="$(ip rule show | wc -l):$(iptables-save | wc -l):$(ip -o link show | wc -l)"

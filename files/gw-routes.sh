@@ -7,6 +7,9 @@
 #     /etc/gateway/gw-routes.sh up   <channel>
 #     /etc/gateway/gw-routes.sh down <channel>
 #
+# And, for the state that belongs to no single channel:
+#     /etc/gateway/gw-routes.sh ensure
+#
 # Idempotent and safe to run by hand at any time; it disconnects nobody. That
 # makes it the recovery path whenever routing state gets flushed.
 #
@@ -83,6 +86,31 @@ eg_type() {
 eg_proto()   { local p; p="$(cfg "EGRESS_${1}_PROTO")"; echo "${p:-wg}"; }
 eg_iface()   { [[ "$(eg_type "$1")" == "direct" ]] && echo "$DEF_IF" || echo "out-$1"; }
 eg_table()   { echo "gw_$1"; }
+
+# --- Failover substitutions --------------------------------------------------
+# gw-health may be carrying one egress's traffic on another while its own path
+# is down. It owns that state, so ask it rather than reading its files: this is
+# the same arrangement as `gw-feeds restore` below, and it keeps the format in
+# one place. `gw-health substitutions` only reads — it never calls back in here.
+#
+# Not installed, or nothing substituted, means every table points where the
+# config says. A path that is down then simply has no default route and its
+# traffic fails closed, which is the behaviour this script had before failover
+# existed. gw-lib.sh carries the same reader for the tools that source it; this
+# copy exists so the boot path depends on nothing but the config.
+HEALTH_SUBS=""
+load_health_subs() {
+    HEALTH_SUBS=""
+    [[ -x /usr/local/bin/gw-health ]] || return 0
+    HEALTH_SUBS="$(/usr/local/bin/gw-health substitutions 2>/dev/null)" || HEALTH_SUBS=""
+    return 0
+}
+# The egress actually carrying <egress> right now — itself, unless substituted.
+eg_effective() {
+    local s
+    s="$(awk -v e="$1" '$1==e {print $2; exit}' <<< "$HEALTH_SUBS")"
+    echo "${s:-$1}"
+}
 
 pol_egress() { cfg "POLICY_${1}_EGRESS"; }
 pol_domains(){ cfg "POLICY_${1}_DOMAINS"; }
@@ -243,15 +271,29 @@ ensure_global() {
     grep -q "^${TBL_LOCAL_ID} ${TBL_LOCAL}$" "$rt" 2>/dev/null || echo "${TBL_LOCAL_ID} ${TBL_LOCAL}" >> "$rt"
 
     # --- One routing table per egress path -----------------------------------
-    local e tbl tid dev
+    # The table belongs to the egress the config names; the device it points at
+    # is whichever egress is carrying that traffic at this moment. They differ
+    # only while gw-health has a substitution in force.
+    load_health_subs
+    local e eff tbl tid dev
     for e in $EGRESS_PATHS; do
         tbl="$(eg_table "$e")"; tid="$(eg_table_id "$e")"
         grep -q "^${tid} ${tbl}$" "$rt" 2>/dev/null || echo "${tid} ${tbl}" >> "$rt"
 
-        if [[ "$(eg_type "$e")" == "direct" ]]; then
+        eff="$(eg_effective "$e")"
+        if [[ "$eff" != "$e" ]]; then
+            if eg_index "$eff" >/dev/null 2>&1; then
+                log "egress '${e}' is being carried by '${eff}' (gw-health)"
+            else
+                log "WARN: gw-health names unknown substitute '${eff}' for '${e}'; ignoring it"
+                eff="$e"
+            fi
+        fi
+
+        if [[ "$(eg_type "$eff")" == "direct" ]]; then
             ip route replace default via "$DEF_GW" dev "$DEF_IF" table "$tbl"
         else
-            dev="$(eg_iface "$e")"
+            dev="$(eg_iface "$eff")"
             if ip link show "$dev" &>/dev/null; then
                 ip route replace default dev "$dev" table "$tbl"
             else
@@ -261,8 +303,10 @@ ensure_global() {
                 # avoiding more than an outage.
                 log "WARN: egress '${e}' (${dev}) is down; ${tbl} left without a default (traffic fails closed)"
             fi
-            egress_endpoint_pin "$e"
         fi
+        # Pinned for the configured path, not the substitute: the pin is what
+        # lets the real tunnel handshake its way back up.
+        [[ "$(eg_type "$e")" == "direct" ]] || egress_endpoint_pin "$e"
 
         # pri 50: whatever a policy rule marked goes out that egress.
         ip rule add fwmark "$(eg_mark "$e")/${MARK_MASK}" lookup "$tbl" priority 50 2>/dev/null || true
@@ -372,9 +416,14 @@ host_dns_egress() {
     [[ -n "$e" ]] || e="$(default_egress)"
     eg_index "$e" >/dev/null 2>&1 || { log "WARN: DNS_EGRESS '${e}' is not a declared egress; skipping"; return 0; }
     [[ "$(eg_type "$e")" == "direct" ]] && return 0   # already the default path
-    mark="$(eg_mark "$e")"; dev="$(eg_iface "$e")"
+    mark="$(eg_mark "$e")"
 
-    ipt_insert_once nat POSTROUTING -o "$dev" -m mark --mark "${mark}/${MARK_MASK}" -j MASQUERADE
+    # Staged for every egress interface, not just this one's: while gw-health
+    # is carrying this path on another, these packets leave through a device
+    # that was never named here.
+    for dev in $(egress_ifaces | sort -u); do
+        ipt_insert_once nat POSTROUTING -o "$dev" -m mark --mark "${mark}/${MARK_MASK}" -j MASQUERADE
+    done
     if uid="$(id -u _dnscrypt-proxy 2>/dev/null)"; then
         ipt_insert_once mangle OUTPUT -m owner --uid-owner "$uid" -p tcp --dport 443 \
             -j MARK --set-mark "${mark}/${MARK_MASK}"
@@ -620,11 +669,23 @@ teardown_channel() {
     return 0
 }
 
+usage() { echo "usage: $0 {up|down} <channel>   |   $0 ensure" >&2; exit 1; }
+
 main() {
     local action="${1:-}" ch="${2:-}"
-    [[ -n "$action" && -n "$ch" ]] || { echo "usage: $0 {up|down} <channel>" >&2; exit 1; }
-    _ch_for_log="$ch"
     [[ $EUID -eq 0 ]] || die "must run as root"
+
+    # Global state only: no channel named, nothing brought up or torn down.
+    # This is how gw-health turns a failover decision into a route, and it is
+    # the smallest thing that repairs flushed policy rules.
+    if [[ "$action" == "ensure" ]]; then
+        ensure_global
+        log "ensure complete"
+        return 0
+    fi
+
+    [[ -n "$action" && -n "$ch" ]] || usage
+    _ch_for_log="$ch"
     [[ " ${INGRESS_CHANNELS} " == *" ${ch} "* ]] || die "'${ch}' is not in INGRESS_CHANNELS"
 
     case "$action" in
@@ -642,7 +703,7 @@ main() {
             fi
             log "down complete"
             ;;
-        *) echo "usage: $0 {up|down} <channel>" >&2; exit 1 ;;
+        *) usage ;;
     esac
 }
 

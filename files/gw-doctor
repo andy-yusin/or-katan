@@ -20,9 +20,20 @@ section() { printf '\n%s== %s ==%s\n' "$CYAN" "$1" "$NC"; }
 [[ -r "$CONF_FILE" ]] || { echo "config not readable: $CONF_FILE" >&2; exit 1; }
 # shellcheck disable=SC1090
 source "$CONF_FILE"
+
+LIB="/etc/gateway/gw-lib.sh"
+[[ -r "$LIB" ]] || LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gw-lib.sh"
+[[ -r "$LIB" ]] || { echo "gw-lib.sh not found (expected /etc/gateway/gw-lib.sh) — re-run install.sh" >&2; exit 1; }
+# shellcheck source=files/gw-lib.sh
+# shellcheck disable=SC1090
+source "$LIB"
 : "${INGRESS_CHANNELS:=}"; : "${EGRESS_PATHS:=direct}"; : "${POLICY_RULES:=}"
 : "${DNS_STACK:=yes}"; : "${DNS_FILTER_ENABLE:=yes}"; : "${GATEWAY_HOST:=}"
-: "${DNS_EGRESS:=}"; : "${DNS_LAN_CLIENTS:=}"
+: "${DNS_EGRESS:=}"; : "${DNS_LAN_CLIENTS:=}"; : "${HEALTH_FAILBACK:=no}"
+
+# Asked once: every section that reports where traffic goes has to agree about
+# a failover in force, or a working substitution reads as a fault.
+SUBS="$(health_subs)"
 
 DEF_IF="$(ip route show default | awk '/default/ {print $5; exit}')"
 cfg() { local v="$1"; echo "${!v-}"; }
@@ -36,6 +47,20 @@ ch_iface(){ echo "in-$1"; }
 ch_egress(){ local e; e="$(cfg "INGRESS_${1}_EGRESS")"; [[ -n "$e" ]] || e="$(echo "$EGRESS_PATHS" | awk '{print $1}')"; echo "$e"; }
 ch_tool() { [[ "$(ch_type "$1")" == "awg" ]] && echo awg || echo wg; }
 net_gw()  { echo "${1%.0/24}.1"; }
+
+# Seconds since a tunnel device's most recent handshake. Empty if it has never
+# completed one — which is a different fault from a stale one, and needs a
+# different answer.
+hs_age() {
+    local dev="$1" tool hs=""
+    for tool in wg awg; do
+        command -v "$tool" >/dev/null || continue
+        hs="$($tool show "$dev" latest-handshakes 2>/dev/null | awk '{print $2}' | sort -rn | head -1)"
+        [[ -n "${hs:-}" ]] && break
+    done
+    [[ -n "${hs:-}" && "$hs" != "0" ]] || return 0
+    echo $(( $(date +%s) - hs ))
+}
 
 # ---------------------------------------------------------------------------
 section "configuration"
@@ -89,14 +114,8 @@ for e in $EGRESS_PATHS; do
     if [[ "$(eg_type "$e")" == "direct" ]]; then
         pass "${e}: direct via ${dev}"
     elif ip link show "$dev" &>/dev/null; then
-        hs=""
-        for t in wg awg; do
-            command -v "$t" >/dev/null || continue
-            hs="$($t show "$dev" latest-handshakes 2>/dev/null | awk '{print $2}' | sort -rn | head -1)"
-            [[ -n "${hs:-}" ]] && break
-        done
-        if [[ -n "${hs:-}" && "$hs" != "0" ]]; then
-            age=$(( $(date +%s) - hs ))
+        age="$(hs_age "$dev")"
+        if [[ -n "$age" ]]; then
             [[ $age -lt 300 ]] && pass "${e}: up, handshake ${age}s ago" \
                                || fail "${e}: last handshake ${age}s ago — the exit is not answering" \
                                        "channels using it are failing closed. gw-egress set <channel> direct"
@@ -112,7 +131,53 @@ for e in $EGRESS_PATHS; do
     else
         fail "${e}: table $(eg_table "$e") has NO default route" "/etc/gateway/gw-routes.sh up <channel>"
     fi
+    # Said after the handshake check rather than instead of it: the path really
+    # is down, and that is worth reporting — but its traffic is moving, so this
+    # is a degradation to look at, not an outage to page about.
+    eff="$(eg_effective "$e" "$SUBS")"
+    [[ "$eff" == "$e" ]] || warn "${e}: its traffic is being carried by '${eff}'" \
+        "gw-health status; gw-health back ${e} once ${e} is working again"
 done
+
+# ---------------------------------------------------------------------------
+FAILOVER_ANY=""
+for e in $EGRESS_PATHS; do [[ -n "$(cfg "EGRESS_${e}_FAILOVER")" ]] && FAILOVER_ANY=yes; done
+if [[ -n "$FAILOVER_ANY" || -n "$SUBS" ]]; then
+section "failover"
+if [[ -n "$FAILOVER_ANY" ]]; then
+    systemctl is-enabled --quiet gw-health.timer 2>/dev/null \
+        && pass "gw-health.timer enabled" \
+        || fail "gw-health.timer is not enabled — nothing is watching the egress paths" "re-run install.sh"
+fi
+for e in $EGRESS_PATHS; do
+    for f in $(cfg "EGRESS_${e}_FAILOVER"); do
+        [[ " ${EGRESS_PATHS} " == *" ${f} "* ]] \
+            || fail "EGRESS_${e}_FAILOVER names undeclared egress '${f}'" "fix it or add ${f} to EGRESS_PATHS"
+        [[ "$f" != "$e" ]] || fail "EGRESS_${e}_FAILOVER lists '${e}' itself"
+    done
+done
+if [[ -z "$SUBS" ]]; then
+    [[ -n "$FAILOVER_ANY" ]] && pass "every egress path is carrying its own traffic"
+else
+    # A substitution is not a fault — it is the mechanism working. What matters
+    # is whether the path it replaced has recovered, because with the default
+    # switch-and-stay policy nothing will hand it back on its own.
+    while read -r e sub since; do
+        [[ -n "${e:-}" ]] || continue
+        mins=$(( ( $(date +%s) - ${since:-0} ) / 60 ))
+        age="$(hs_age "$(eg_iface "$e")")"
+        if [[ "$(eg_type "$e")" != "direct" ]] && [[ -z "$age" || "$age" -ge 300 ]]; then
+            warn "'${e}' has been carried by '${sub}' for ${mins}m, and is still not answering" \
+                 "gw-health status"
+        elif [[ "$HEALTH_FAILBACK" == "yes" ]]; then
+            pass "'${e}' looks healthy again; the next check hands it back (HEALTH_FAILBACK=yes)"
+        else
+            warn "'${e}' looks healthy again but is still carried by '${sub}' (${mins}m)" \
+                 "gw-health back ${e}"
+        fi
+    done <<< "$SUBS"
+fi
+fi
 
 # ---------------------------------------------------------------------------
 section "actual paths"
@@ -122,7 +187,7 @@ rules="$(ip rule show)"
 for c in $INGRESS_CHANNELS; do
     iface="$(ch_iface "$c")"; net="$(ch_net "$c")"
     ip link show "$iface" &>/dev/null || continue
-    want="$(eg_iface "$(ch_egress "$c")")"
+    want="$(eg_iface "$(eg_effective "$(ch_egress "$c")" "$SUBS")")"
     probe="${net%.0/24}.2"
     route="$(ip route get 1.1.1.1 from "$probe" iif "$iface" 2>/dev/null | head -1)"
     dev="$(awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' <<< "$route")"

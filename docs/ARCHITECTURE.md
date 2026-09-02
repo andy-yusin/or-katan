@@ -145,6 +145,38 @@ exists to avoid. An outage is recoverable and visible; a leak is neither.
 `gw-doctor` and `gw-egress test` both report it, and `gw-egress set <channel>
 direct` is the deliberate fallback.
 
+## Failover
+
+`EGRESS_<path>_FAILOVER` turns that outage into a degradation. `gw-health`,
+run by a timer, fetches a URL bound to each watched path's own interface — a
+tunnel that is up and handshaking but not carrying packets fails that, which is
+the failure an interface check cannot see — and after `HEALTH_THRESHOLD`
+consecutive failures it looks for the first listed alternative that answers.
+
+What changes is a single route: the default in `gw_<path>`, pointed at the
+substitute's interface. Everything that reaches that table follows — the
+channels whose default egress it is, the destinations a policy rule marked for
+it, and the gateway's own DNS. Nothing is repointed one at a time, no client is
+disconnected, and `gateway.conf` is not rewritten: the config says where traffic
+is meant to go, and the substitution says where it can go at this moment.
+
+The substitution lives in `/var/lib/gateway/health/substitutions` and outlives a
+reboot, so bring-up restores the working path rather than pointing the table
+back at a dead one. `gw-routes.sh` asks `gw-health` for it while building the
+tables; with nothing substituted, or `gw-health` not installed, every table
+points where the config says.
+
+The policy is switch-and-stay. A recovered path is not taken back automatically
+unless `HEALTH_FAILBACK="yes"`, because a path that failed once usually flaps
+and each flap moves the apparent location of every client on it. `gw-doctor`
+reports when the original is answering again; `gw-health back <path>` returns
+it.
+
+Listing `direct` as a fallback is allowed and is a different kind of answer
+from another tunnel: it keeps clients online from this gateway's own address,
+which is the leak the section above is about. The installer says so when you
+configure it.
+
 ## Marks and the gateway's own traffic
 
 The gateway resolves DNS on behalf of every client. Those queries are generated
@@ -235,7 +267,7 @@ lookup for every client pays it. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 |---|---|
 | `/etc/gateway/gateway.conf` | the configuration every tool reads at runtime |
 | `/etc/gateway/gw-routes.sh` | routing/NAT/firewall, run from PostUp |
-| `/etc/gateway/gw-lib.sh` | the config writer, sourced by `gw-config` and `gw-egress` |
+| `/etc/gateway/gw-lib.sh` | helpers shared between tools, sourced by `gw-config`, `gw-egress` and `gw-doctor` |
 | `/etc/gateway/keys/` | gateway private keys — never rotated by the installer |
 | `/etc/gateway/awg-params.conf` | this gateway's obfuscation signature |
 | `/etc/gateway/clients/` | issued client configs and QR images |
@@ -243,6 +275,8 @@ lookup for every client pays it. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 | `/etc/amnezia/amneziawg/in-<channel>.conf` | an `awg` channel's interface + client list |
 | `/etc/wireguard/out-<egress>.conf` | a tunnel egress |
 | `*.conf.bak-<timestamp>` | the previous interface config, kept only when one actually changed; the last three survive. Private keys — treat them as live |
+| `/var/lib/gateway/feeds/<rule>.list` | the last list a policy feed accepted |
+| `/var/lib/gateway/health/substitutions` | which path is carrying which, while a failover is in force |
 
 `gw-routes.sh` is idempotent and safe to run by hand — it is the recovery path
 whenever routing state is flushed:

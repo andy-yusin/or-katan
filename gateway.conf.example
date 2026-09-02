@@ -79,6 +79,39 @@ EGRESS_direct_TYPE="direct"
 #EGRESS_main_CONF_FILE="/root/provider-nl.conf"
 #EGRESS_main_PORT="51900"
 
+# --- Failover: somewhere to go when a path stops working ---------------------
+# An exit that goes down takes everything pointed at it with it. Without this
+# that is an outage: the table for that path is left with no default route and
+# its traffic fails closed, which is safe and completely unusable.
+#
+# Name one or more paths to carry it instead, in preference order, and the
+# gateway probes it every HEALTH_INTERVAL seconds and moves its traffic to the
+# first listed path that answers. Channels, policy rules and the gateway's own
+# DNS all follow, because what moves is the path's routing table and not the
+# things pointed at it. Nothing is disconnected and gateway.conf is not
+# rewritten — this file keeps saying where traffic is meant to go.
+#
+# 'direct' is allowed here and is not the same kind of answer as another
+# tunnel: it keeps clients online, from this gateway's own address. If the
+# whole point of the tunnel is that the address is not this one, do not list
+# it. The installer says so out loud when you do.
+#EGRESS_main_FAILOVER="backup uk"
+
+# The check itself. It probes by fetching a URL bound to the path's own
+# interface, so it sees what a client would: a tunnel that is up, handshaking
+# and still not carrying packets fails, which is the failure worth catching.
+#HEALTH_TARGETS="https://1.1.1.1 https://8.8.8.8"   # tried in order, any answer passes
+#HEALTH_INTERVAL="30"        # seconds between checks
+#HEALTH_TIMEOUT="5"          # seconds a single target gets to answer
+#HEALTH_THRESHOLD="2"        # consecutive failures before a path is moved
+#HEALTH_COOLDOWN="120"       # seconds before another move is allowed
+
+# Switch and stay. A path that failed once usually flaps, and every flap moves
+# the apparent location of every client on it, so a recovered path is not taken
+# back automatically: gw-doctor reports it and `gw-health back <path>` returns
+# it. Set this to "yes" if you would rather it returned on its own.
+#HEALTH_FAILBACK="no"
+
 
 # =============================================================================
 # INGRESS CHANNELS — who comes in

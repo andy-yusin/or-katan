@@ -1,0 +1,295 @@
+#!/bin/bash
+#
+# gw-health — probe every egress path and carry its traffic on another one when
+# it stops working.
+#
+#   gw-health                        what is healthy, and what is standing in
+#   gw-health check                  probe and act — what the timer runs
+#   gw-health switch <eg> <sub>      carry <eg>'s traffic on <sub>, by hand
+#   gw-health back <eg>|all          stop standing in; back to the config
+#   gw-health substitutions          the machine-readable form, for other tools
+#
+# ---------------------------------------------------------------------------
+# What a failover changes, and what it deliberately does not
+# ---------------------------------------------------------------------------
+# gateway.conf says where traffic is meant to go, and this never rewrites it: a
+# tunnel that is down for ten minutes should not quietly become the operator's
+# stated intent, and a config that edits itself is a config nobody can reason
+# about afterwards.
+#
+# What changes is one route — the default in table gw_<egress>, pointed at the
+# substitute's interface instead of its own. Everything that reaches that table
+# follows: the channels whose default egress it is, the destinations a policy
+# rule marked for it, and the gateway's own DNS. Nothing is repointed one by
+# one, no client is disconnected, and putting it back is the same single route.
+#
+# The policy is switch-and-stay. A recovered path is not taken back
+# automatically unless HEALTH_FAILBACK=yes, because a path that failed once
+# usually flaps, and every flap moves the apparent location of every client on
+# it — which is worse than staying on a working substitute until someone looks.
+#
+# Nothing here is required for the gateway to be safe. A dead egress whose
+# table has no default fails closed on its own; failover is what turns that
+# outage into a degradation.
+set -uo pipefail
+
+CONF_FILE="${GATEWAY_CONF:-/etc/gateway/gateway.conf}"
+ROUTES="/etc/gateway/gw-routes.sh"
+STATE_DIR="/var/lib/gateway/health"
+SUBS_FILE="${STATE_DIR}/substitutions"
+RUN_DIR="/run/gw-health"
+LOCK_FILE="/run/gw-health.lock"
+
+RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; BOLD=$'\033[1m'; DIM=$'\033[2m'; NC=$'\033[0m'
+log()  { printf '%s\n' "$*" >&2; }
+ok()   { printf '  %s✓%s %s\n' "$GREEN" "$NC" "$*" >&2; }
+warn() { printf '  %s!%s %s\n' "$YELLOW" "$NC" "$*" >&2; }
+err()  { printf '  %s✗%s %s\n' "$RED" "$NC" "$*" >&2; }
+die()  { printf '%sERROR:%s %s\n' "$RED" "$NC" "$*" >&2; exit 1; }
+
+[[ $EUID -eq 0 ]] || die "must run as root"
+[[ -r "$CONF_FILE" ]] || die "config not readable: $CONF_FILE"
+# shellcheck disable=SC1090
+source "$CONF_FILE"
+: "${EGRESS_PATHS:=direct}"
+: "${HEALTH_TARGETS:=https://1.1.1.1 https://8.8.8.8}"
+: "${HEALTH_TIMEOUT:=5}"
+: "${HEALTH_THRESHOLD:=2}"
+: "${HEALTH_COOLDOWN:=120}"
+: "${HEALTH_FAILBACK:=no}"
+
+DEF_IF="$(ip route show default | awk '/default/ {print $5; exit}')"
+
+cfg()       { local v="$1"; echo "${!v-}"; }
+eg_type()   { local t; t="$(cfg "EGRESS_${1}_TYPE")"; [[ -n "$t" ]] || { [[ "$1" == "direct" ]] && t="direct" || t=""; }; echo "$t"; }
+eg_iface()  { [[ "$(eg_type "$1")" == "direct" ]] && echo "$DEF_IF" || echo "out-$1"; }
+eg_exists() { [[ " ${EGRESS_PATHS} " == *" ${1} "* ]]; }
+fallbacks() { cfg "EGRESS_${1}_FAILOVER"; }
+
+# --- Probing ----------------------------------------------------------------
+# Reachability, not liveness. A tunnel can be up and handshaking and still not
+# carry a packet past the exit — which is the failure this exists for, and the
+# one an interface check or a handshake age cannot see. --interface binds the
+# socket to the device, so the probe takes the path under test whatever the
+# routing tables would otherwise have decided.
+probe() {
+    local e="$1" dev t
+    dev="$(eg_iface "$e")"
+    [[ -n "$dev" ]] || return 1
+    ip link show dev "$dev" &>/dev/null || return 1
+    for t in $HEALTH_TARGETS; do
+        curl --interface "$dev" --max-time "$HEALTH_TIMEOUT" -sSk -o /dev/null "$t" 2>/dev/null && return 0
+    done
+    return 1
+}
+
+# A tunnel that crashed after boot stays down: its unit is oneshot and nothing
+# retries it. Try once before writing the path off, and again before rejecting
+# it as a substitute.
+ensure_link() {
+    local e="$1" dev
+    [[ "$(eg_type "$e")" == "direct" ]] && return 0
+    dev="$(eg_iface "$e")"
+    ip link show dev "$dev" &>/dev/null && return 0
+    log "${dev} is down — bringing it up"
+    if [[ -f "/etc/amnezia/amneziawg/${dev}.conf" ]]; then
+        awg-quick up "$dev" &>/dev/null
+    else
+        wg-quick up "$dev" &>/dev/null
+    fi
+    ip link show dev "$dev" &>/dev/null
+}
+
+# --- Substitution state ------------------------------------------------------
+# One line per substituted path: "<egress> <substitute> <epoch when it started>".
+sub_of()    { [[ -r "$SUBS_FILE" ]] || return 0; awk -v e="$1" '$1==e {print $2; exit}' "$SUBS_FILE"; }
+sub_since() { [[ -r "$SUBS_FILE" ]] || return 0; awk -v e="$1" '$1==e {print $3; exit}' "$SUBS_FILE"; }
+
+sub_write() {   # <egress> <substitute|"">   — empty substitute removes the line
+    local e="$1" s="$2" tmp
+    mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
+    tmp="$(mktemp "${SUBS_FILE}.XXXXXX")" || return 1
+    [[ -r "$SUBS_FILE" ]] && grep -v "^${e} " "$SUBS_FILE" >> "$tmp"
+    [[ -n "$s" ]] && printf '%s %s %s\n' "$e" "$s" "$(date +%s)" >> "$tmp"
+    mv "$tmp" "$SUBS_FILE"
+}
+
+# gw-routes.sh owns the routing tables and knows the difference between a
+# tunnel device and the uplink's gateway address; re-running it is how a
+# substitution becomes a route. It reads the substitutions back through this
+# tool, so keep `substitutions` free of anything that could call in here again.
+apply() {
+    [[ -x "$ROUTES" ]] || { err "${ROUTES} is missing — the route was not applied"; return 1; }
+    "$ROUTES" ensure >/dev/null || { err "gw-routes.sh ensure failed"; return 1; }
+    return 0
+}
+
+fails_get() { local f="${RUN_DIR}/fails.$1"; [[ -r "$f" ]] && cat "$f" 2>/dev/null || echo 0; }
+fails_set() { mkdir -p "$RUN_DIR"; echo "$2" > "${RUN_DIR}/fails.$1"; }
+stamp()     { mkdir -p "$RUN_DIR"; date +%s > "${RUN_DIR}/lastswitch"; }
+cooling()   {
+    local last now
+    last="$(cat "${RUN_DIR}/lastswitch" 2>/dev/null || echo 0)"
+    now="$(date +%s)"
+    (( now - last < HEALTH_COOLDOWN ))
+}
+
+# The paths worth probing: those with somewhere to fail over to, plus any that
+# is currently being carried — that one has to be watched to know when it is
+# safe to hand back.
+watched() {
+    local e
+    for e in $EGRESS_PATHS; do
+        [[ -n "$(fallbacks "$e")" || -n "$(sub_of "$e")" ]] && printf '%s\n' "$e"
+    done
+    return 0
+}
+
+human_age() {   # <epoch> -> "3h" / "12m" / "-"
+    local t="${1:-}" d
+    [[ -n "$t" && "$t" =~ ^[0-9]+$ ]] || { echo "-"; return 0; }
+    d=$(( $(date +%s) - t ))
+    if   (( d < 3600 ));  then echo "$(( d / 60 ))m"
+    elif (( d < 86400 )); then echo "$(( d / 3600 ))h"
+    else                       echo "$(( d / 86400 ))d"; fi
+}
+
+# --- Commands ----------------------------------------------------------------
+cmd_check() {
+    mkdir -p "$RUN_DIR"
+    local e sub n cand picked changed=no
+    for e in $(watched); do
+        ensure_link "$e"
+        sub="$(sub_of "$e")"
+
+        if probe "$e"; then
+            fails_set "$e" 0
+            [[ -n "$sub" ]] || continue
+            if [[ "$HEALTH_FAILBACK" == "yes" ]]; then
+                log "'${e}' is healthy again — returning it to its own path"
+                sub_write "$e" "" && changed=yes
+                stamp
+            else
+                log "'${e}' is healthy again but still carried by '${sub}' — 'gw-health back ${e}' to return it"
+            fi
+            continue
+        fi
+
+        # Already carried, and the stand-in still works: nothing to decide.
+        if [[ -n "$sub" ]] && probe "$sub"; then
+            continue
+        fi
+
+        n=$(( $(fails_get "$e") + 1 )); fails_set "$e" "$n"
+        log "'${e}' failed its probe (${n}/${HEALTH_THRESHOLD})"
+        (( n >= HEALTH_THRESHOLD )) || continue
+        if cooling; then log "in cooldown — not switching"; continue; fi
+
+        picked=""
+        for cand in $(fallbacks "$e"); do
+            [[ "$cand" == "$e" ]] && continue
+            eg_exists "$cand" || { log "EGRESS_${e}_FAILOVER names undeclared egress '${cand}'"; continue; }
+            ensure_link "$cand"
+            if probe "$cand"; then picked="$cand"; break; fi
+            log "  '${cand}' is not healthy either"
+        done
+        if [[ -z "$picked" ]]; then
+            log "no healthy substitute for '${e}' — its traffic keeps failing closed"
+            continue
+        fi
+        log "FAILOVER: '${e}' is down; carrying its traffic on '${picked}'"
+        sub_write "$e" "$picked" && changed=yes
+        fails_set "$e" 0
+        stamp
+    done
+    [[ "$changed" == yes ]] && apply
+    return 0
+}
+
+cmd_status() {
+    local e sub state list
+    printf '%s%-12s %-14s %-12s %-7s %s%s\n' "$BOLD" EGRESS STATE "CARRIED BY" SINCE "FAILS OVER TO" "$NC"
+    for e in $EGRESS_PATHS; do
+        sub="$(sub_of "$e")"
+        list="$(fallbacks "$e")"
+        if [[ -z "$list" && -z "$sub" ]]; then
+            state="${DIM}not watched${NC}"
+        elif probe "$e"; then
+            state="${GREEN}healthy${NC}"
+        elif ip link show dev "$(eg_iface "$e")" &>/dev/null; then
+            state="${RED}unreachable${NC}"
+        else
+            state="${RED}down${NC}"
+        fi
+        printf '%-12s %-25b %-12s %-7s %s\n' \
+            "$e" "$state" "${sub:--}" "$(human_age "$(sub_since "$e")")" "${DIM}${list:--}${NC}"
+    done
+    [[ -s "$SUBS_FILE" ]] || return 0
+    echo
+    if [[ "$HEALTH_FAILBACK" == "yes" ]]; then
+        echo "A substituted path returns on its own once it probes healthy (HEALTH_FAILBACK=yes)."
+    else
+        echo "Substitutions stay until you end them: gw-health back <egress>|all"
+    fi
+}
+
+cmd_switch() {
+    local e="${1:-}" s="${2:-}"
+    [[ -n "$e" && -n "$s" ]] || die "usage: gw-health switch <egress> <substitute>"
+    eg_exists "$e" || die "'${e}' is not in EGRESS_PATHS (${EGRESS_PATHS})"
+    eg_exists "$s" || die "'${s}' is not in EGRESS_PATHS (${EGRESS_PATHS})"
+    [[ "$e" != "$s" ]] || die "'${e}' cannot stand in for itself"
+    ensure_link "$s"
+    ip link show dev "$(eg_iface "$s")" &>/dev/null \
+        || die "${s}'s interface is not up — pointing ${e} at it would blackhole its traffic"
+    sub_write "$e" "$s" || die "could not record the substitution"
+    stamp
+    apply || die "the substitution was recorded but the route was not applied — ${ROUTES} ensure"
+    ok "'${e}' is now carried by '${s}'"
+}
+
+cmd_back() {
+    local t="${1:-}" e any=no
+    [[ -n "$t" ]] || die "usage: gw-health back <egress>|all"
+    if [[ "$t" == "all" ]]; then
+        for e in $(cmd_substitutions | awk '{print $1}'); do sub_write "$e" "" && any=yes; done
+    else
+        eg_exists "$t" || die "'${t}' is not in EGRESS_PATHS (${EGRESS_PATHS})"
+        [[ -n "$(sub_of "$t")" ]] || { ok "'${t}' is already on its own path"; return 0; }
+        sub_write "$t" "" && any=yes
+    fi
+    [[ "$any" == yes ]] || { ok "nothing was being substituted"; return 0; }
+    # A path that is still broken would be failed over again on the next check.
+    # The cooldown is what gives whoever ran this a window to work in.
+    stamp
+    apply || die "the substitution was cleared but the route was not applied — ${ROUTES} ensure"
+    ok "back on the configured path: ${t}"
+}
+
+# Read-only, and deliberately so: gw-routes.sh calls this while building the
+# routing tables that apply() then asks it to rebuild.
+cmd_substitutions() {
+    [[ -r "$SUBS_FILE" ]] || return 0
+    local e s t
+    while read -r e s t; do
+        [[ -n "${e:-}" && -n "${s:-}" ]] || continue
+        # A path removed from the config since the substitution was recorded
+        # would otherwise send a reader looking for an interface that is never
+        # coming back.
+        eg_exists "$e" && eg_exists "$s" || continue
+        printf '%s %s %s\n' "$e" "$s" "${t:-0}"
+    done < "$SUBS_FILE"
+    return 0
+}
+
+usage() { sed -n '3,10p' "$0" | sed 's/^# \{0,1\}//'; }
+
+case "${1:-status}" in
+    check)   exec 9>"$LOCK_FILE"; flock -n 9 || { log "another run is in progress"; exit 0; }; cmd_check ;;
+    switch)  shift; exec 9>"$LOCK_FILE"; flock -n 9 || die "another run is in progress"; cmd_switch "$@" ;;
+    back)    shift; exec 9>"$LOCK_FILE"; flock -n 9 || die "another run is in progress"; cmd_back "$@" ;;
+    status)  cmd_status ;;
+    substitutions) cmd_substitutions ;;
+    -h|--help|help) usage ;;
+    *) usage; exit 1 ;;
+esac

@@ -44,6 +44,7 @@ LIB="/etc/gateway/gw-lib.sh"
 # shellcheck disable=SC1090
 source "$LIB"
 : "${INGRESS_CHANNELS:=}"; : "${EGRESS_PATHS:=direct}"; : "${POLICY_RULES:=}"
+SUBS=""
 
 DEF_IF="$(ip route show default | awk '/default/ {print $5; exit}')"
 
@@ -69,7 +70,8 @@ eg_age() {
 }
 
 show_status() {
-    local e dev state age users c
+    local e dev state age users c eff
+    SUBS="$(health_subs)"
     printf '%s%-10s %-8s %-12s %-22s %s%s\n' "$BOLD" EGRESS TYPE INTERFACE STATE "CHANNELS" "$NC"
     for e in $EGRESS_PATHS; do
         dev="$(eg_iface "$e")"
@@ -88,6 +90,10 @@ show_status() {
             [[ "$(ch_egress "$c")" == "$e" ]] && users="${users}${users:+, }${c}"
         done
         printf '%-10s %-8s %-12s %-22b %s\n' "$e" "$(eg_type "$e")" "$dev" "$state" "${users:--}"
+        eff="$(eg_effective "$e" "$SUBS")"
+        [[ "$eff" == "$e" ]] || \
+            printf '           %sits traffic is being carried by %s while it is down (gw-health back %s)%s\n' \
+                "$YELLOW" "$eff" "$e" "$NC"
     done
     echo
     echo "${CYAN}routing tables${NC}"
@@ -101,13 +107,17 @@ show_status() {
 # leave clients connected while silently egressing from the wrong place.
 show_test() {
     local c net probe route want dev
+    SUBS="$(health_subs)"
     echo "${CYAN}actual egress per channel${NC}"
     for c in $INGRESS_CHANNELS; do
         net="$(ch_net "$c")"
         ip link show "$(ch_iface "$c")" &>/dev/null || { printf '  %-12s %s\n' "$c" "interface down"; continue; }
         probe="${net%.0/24}.2"
         route="$(ip route get 1.1.1.1 from "$probe" iif "$(ch_iface "$c")" 2>/dev/null | head -1)" || route=""
-        want="$(eg_iface "$(ch_egress "$c")")"
+        # Where it should be leaving, given any failover in force. Comparing
+        # against the configured path instead would report a working
+        # substitution as a leak.
+        want="$(eg_iface "$(eg_effective "$(ch_egress "$c")" "$SUBS")")"
         dev="$(awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' <<< "$route")"
         if [[ -z "$route" ]]; then
             printf '  %-12s %sno route%s (expected %s)\n' "$c" "$RED" "$NC" "$want"

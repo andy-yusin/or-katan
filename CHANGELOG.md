@@ -37,6 +37,38 @@ see what it makes of your config without changing the box.
   set size, how long since the last successful refresh, and whether the timer is
   enabled.
 
+- **Egress failover.** An egress path can name others to carry its traffic when
+  it stops working. A timer probes each watched path by fetching a URL bound to
+  that path's own interface — so a tunnel that is up and handshaking but not
+  carrying packets fails it, which an interface or handshake check cannot see —
+  and after `HEALTH_THRESHOLD` consecutive failures moves its traffic to the
+  first listed alternative that answers.
+
+  What moves is one route: the default in that path's routing table. The
+  channels, policy rules and gateway DNS pointed at it all follow, nothing is
+  disconnected, and `gateway.conf` is never rewritten — the config keeps saying
+  where traffic is meant to go, and the substitution says where it can go now.
+  It survives a reboot, so bring-up restores the working path instead of
+  pointing the table back at a dead one, and a check that finds no healthy
+  candidate changes nothing rather than moving traffic somewhere that also does
+  not work.
+
+  The policy is switch-and-stay: a recovered path is not taken back unless
+  `HEALTH_FAILBACK="yes"`, because each flap moves the apparent location of
+  every client on that path. New tool `gw-health` (`status` / `check` /
+  `switch` / `back`); `gw-doctor` reports any substitution in force and says
+  when the original is answering again, and `gw-egress` no longer reads a live
+  failover as a leak.
+
+### Changed
+
+- `gw-routes.sh` accepts `ensure`, which re-asserts the global routing state
+  without naming a channel. It is how a failover becomes a route, and the
+  smallest thing that repairs flushed policy rules.
+- The gateway's own DNS is now MASQUERADEd out of every declared egress
+  interface rather than only the one `DNS_EGRESS` names, so those queries keep
+  working while that path is being carried by another.
+
 ### Config
 
 - Added `POLICY_<rule>_FEED` — space-separated http, https or file URLs, tried
@@ -45,6 +77,12 @@ see what it makes of your config without changing the box.
   failure. Default 100.
 - Added `POLICY_FEED_SCHEDULE` — any systemd `OnCalendar` expression. Default
   `daily`, with an hour of randomised delay.
+- Added `EGRESS_<path>_FAILOVER` — other paths, in preference order, to carry
+  this one when it fails. Unset means the path is never moved and never used as
+  a substitute. Declaring it on any path is what installs the health timer.
+- Added `HEALTH_TARGETS` (default `https://1.1.1.1 https://8.8.8.8`),
+  `HEALTH_INTERVAL` (30s), `HEALTH_TIMEOUT` (5s), `HEALTH_THRESHOLD` (2),
+  `HEALTH_COOLDOWN` (120s) and `HEALTH_FAILBACK` (`no`).
 
 ## [0.1.0] — 2026-09-01
 

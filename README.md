@@ -225,6 +225,8 @@ See [profiles/README.md](profiles/README.md).
 | `gw-config` | the whole configuration, grouped |
 | `gw-config set DNS_FILTER_ENABLE no` | change one setting, validated and applied |
 | `gw-config profile ru` | swap the destination policy wholesale |
+| `gw-health` | which paths are answering, and what is standing in for what |
+| `gw-health back main` | end a failover once the path is working again |
 | `gw-doctor` | check every layer |
 
 Anything that changes the config validates first, and rolls back if *either*
