@@ -68,8 +68,14 @@ POLICY_stream_EGRESS="uk"
 POLICY_stream_DOMAINS="stream.example streamcdn.example"
 ```
 
-Each rule gets two ipsets: `gwp_<rule>` for the static CIDRs, and
-`gwpd_<rule>` which dnsmasq fills as names resolve:
+Each rule gets three ipsets, and a destination matching any of them takes the
+rule's egress:
+
+| set | filled by | scale |
+|---|---|---|
+| `gwp_<rule>` | `POLICY_<rule>_CIDRS`, rebuilt from config on every bring-up | a handful |
+| `gwpd_<rule>` | dnsmasq, as the rule's domains resolve | hundreds |
+| `gwpf_<rule>` | `gw-feeds`, from `POLICY_<rule>_FEED` on a timer | tens of thousands |
 
 ```
 ipset=/bank.example/tax.gov.example/gwpd_home
@@ -82,8 +88,37 @@ one — `.ru` out `direct`, but one specific `.ru` domain hosted abroad back ont
 the tunnel.
 
 Static CIDR lists go stale and never cover a CDN, which is why domain matching
-is the primary mechanism. The sets start empty after a reboot and fill as names
+is the primary mechanism. `gwpd_` starts empty after a reboot and fills as names
 resolve; resolution always precedes traffic, so this heals itself.
+
+### Feeds
+
+Domain matching cannot help with a destination reached by address before any
+name is looked up, and some rules need those in numbers nobody maintains by
+hand — a country's allocations, a large provider's ranges. `POLICY_<rule>_FEED`
+points at published lists; `gw-feeds` fetches them on a timer into `gwpf_<rule>`.
+
+Everything about that path is built so a bad fetch cannot change routing:
+
+- Sources are tried in order, and a download shorter than `FEED_MIN` counts as a
+  failure rather than as a shorter list — that is what catches a 404 page, a
+  truncated transfer, or a source that has quietly emptied.
+- If every source fails, **the previously loaded list stays**. An emptied set
+  does not fail closed, it fails silently: every destination the rule covered
+  starts taking the channel default instead. On a rule pointing at the local
+  uplink that means domestic traffic quietly leaving through a foreign exit.
+- Private, loopback, link-local and multicast prefixes are dropped whatever the
+  source says. A feed containing `0.0.0.0/0` would otherwise blackhole the
+  gateway into one egress.
+- The swap into the live set is atomic, so a gateway carrying traffic never sees
+  a window where the rule stops matching.
+- The last good list is cached under `/var/lib/gateway/feeds/`, and reloaded on
+  bring-up — ipsets are kernel state, so without that a reboot would leave the
+  set empty until the timer next fired.
+
+`gw-doctor` reports the set size, how long since the last successful refresh,
+and whether the timer is enabled. A feed that has stopped refreshing is the
+quiet failure worth watching for: nothing breaks, the list just ages.
 
 ## Isolation
 

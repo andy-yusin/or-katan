@@ -197,6 +197,41 @@ POLICY_RULES=""
 #
 # Seeds are static, so they age. Treat them as a supplement to domain matching,
 # never a replacement, and re-check them if a service starts misbehaving.
+#
+# --- Feeds: when the list is too big to write down ----------------------------
+# Some rules need addresses in numbers no one maintains by hand — a country's
+# allocations, a large provider's ranges. POLICY_<rule>_FEED subscribes the rule
+# to a published list, fetched on a timer into a third ipset (gwpf_<rule>) that
+# matches exactly like the other two:
+#
+#   POLICY_stream_FEED="https://example.org/primary.txt https://example.net/backup.txt"
+#   POLICY_stream_FEED_MIN="500"
+#
+# Space-separated, tried in order until one works. The file is one CIDR per
+# line; comments and anything that is not a routable prefix are ignored, and
+# private, loopback, link-local and multicast ranges are dropped whatever the
+# source says.
+#
+# FEED_MIN is the floor below which a download is treated as a failure rather
+# than as a shorter list (default 100). It is what stops a 404 page, a truncated
+# transfer or a source that has quietly emptied from wiping the set — on a rule
+# pointing at the local uplink, an emptied set silently sends every destination
+# it covered out through a foreign exit instead. On any failure the previous
+# list stays loaded, and gw-doctor reports how long it has been since the last
+# successful refresh.
+#
+# Prefer https — the URL is a routing decision, and anyone who can rewrite a
+# plain-http response chooses where your traffic goes. A file:// URL is accepted
+# too, for a list mirrored locally or a gateway with no route to the source.
+#
+# Managed with `gw-feeds` (update / restore / status); the last good list is
+# cached on disk, so a reboot does not leave the set empty until the timer next
+# fires.
+
+# When the feeds refresh. Any systemd OnCalendar expression — "daily",
+# "weekly", "*-*-* 03:00:00". An hour of random delay is added so everyone
+# pointed at the same public list does not hit it on the same second.
+POLICY_FEED_SCHEDULE="daily"
 
 
 # =============================================================================

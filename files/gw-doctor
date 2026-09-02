@@ -175,8 +175,10 @@ grep -q "dport 853 -j REJECT" <<< "$fwd" \
 # ---------------------------------------------------------------------------
 if [[ -n "$POLICY_RULES" ]]; then
 section "destination policy"
+FEED_ANY=""
+for r in $POLICY_RULES; do [[ -n "$(cfg "POLICY_${r}_FEED")" ]] && FEED_ANY=yes; done
 for r in $POLICY_RULES; do
-    for s in "gwp_${r}" "gwpd_${r}"; do
+    for s in "gwp_${r}" "gwpd_${r}" "gwpf_${r}"; do
         if ipset list -n 2>/dev/null | grep -qx "$s"; then
             n="$(ipset list "$s" 2>/dev/null | awk '/Number of entries/{print $4}')"
             pass "ipset ${s} (${n} entries)"
@@ -184,7 +186,28 @@ for r in $POLICY_RULES; do
             fail "ipset ${s} missing" "/etc/gateway/gw-routes.sh up <channel>"
         fi
     done
+    # A feed that has stopped refreshing is the quiet failure this whole check
+    # exists for: the set keeps its last good contents, so nothing looks broken
+    # while the list silently ages out of date.
+    feed="$(cfg "POLICY_${r}_FEED")"
+    [[ -n "$feed" ]] || continue
+    sf="/var/lib/gateway/feeds/${r}.list"
+    if [[ ! -s "$sf" ]]; then
+        fail "feed '${r}' has never been fetched" "gw-feeds update ${r}"
+    else
+        age=$(( ( $(date +%s) - $(stat -c %Y "$sf" 2>/dev/null || echo 0) ) / 86400 ))
+        if [[ "$age" -le 7 ]]; then
+            pass "feed ${r}: refreshed ${age}d ago"
+        else
+            warn "feed ${r}: last refreshed ${age}d ago" "systemctl status gw-feeds.timer; gw-feeds update ${r}"
+        fi
+    fi
 done
+if [[ -n "$FEED_ANY" ]]; then
+    systemctl is-enabled --quiet gw-feeds.timer 2>/dev/null \
+        && pass "gw-feeds.timer enabled" \
+        || fail "gw-feeds.timer is not enabled — feeds will never refresh" "re-run install.sh"
+fi
 fi
 
 # ---------------------------------------------------------------------------

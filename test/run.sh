@@ -92,6 +92,28 @@ else
         || echo "  ROLLBACK BROKEN: value is now $(gw-config get "INGRESS_${c}_NET")"
 fi
 
+
+# Only the fixtures that subscribe a rule to a feed exercise this.
+if grep -q "^POLICY_[a-z_]*_FEED=" /work/gateway.conf; then
+    echo
+    echo "==> policy feeds"
+    fr=$(grep -oE "^POLICY_[a-z_]+_FEED=" /work/gateway.conf | sed -E "s/^POLICY_(.*)_FEED=$/\1/" | head -1)
+    n=$(ipset list "gwpf_${fr}" 2>/dev/null | awk "/Number of entries/{print \$4}") || n=0
+    # The list carries 150 usable prefixes and four the sanitiser must drop.
+    [ "${n:-0}" = "150" ] && echo "  ${fr}: ${n} prefixes loaded, junk lines dropped" \
+                          || echo "  FEED BROKEN: gwpf_${fr} holds ${n:-0}, expected 150"
+    ipset list "gwpf_${fr}" 2>/dev/null | grep -qE "^(10\.|192\.168\.|0\.0\.0\.0)" \
+        && echo "  FEED BROKEN: a private or default range survived the sanitiser" \
+        || echo "  private and 0.0.0.0/0 entries rejected"
+    # Fail closed: a dead source must leave the loaded list alone.
+    gw-config --no-apply set "POLICY_${fr}_FEED" "https://127.0.0.1:9/gone.txt" >/dev/null 2>&1 || true
+    gw-feeds update >/dev/null 2>&1 || true
+    n2=$(ipset list "gwpf_${fr}" 2>/dev/null | awk "/Number of entries/{print \$4}") || n2=0
+    [ "${n2:-0}" = "150" ] && echo "  a dead source leaves the previous list loaded" \
+                           || echo "  FEED BROKEN: a failed fetch emptied the set (${n2:-0} left)"
+    gw-config --no-apply set "POLICY_${fr}_FEED" "file:///work/test/fixtures/policy-feed.list" >/dev/null 2>&1 || true
+fi
+
 echo
 echo "==> idempotency: install again, rule counts must not move"
 before="$(ip rule show | wc -l):$(iptables-save | wc -l):$(ip -o link show | wc -l)"

@@ -65,6 +65,7 @@ because the next install regenerates it.
 | `files/gw-egress` | Inspect, switch, add and remove egress paths. |
 | `files/gw-config` | Read/write config keys, apply profiles, validate, apply. |
 | `files/gw-doctor` | Layered health check. Start here when debugging. |
+| `files/gw-feeds` | Fetches the address lists policy rules subscribe to. Run by a timer. |
 | `files/gw-lib.sh` | The config writer, sourced by `gw-config` and `gw-egress`. Sourced, never run. Anything that writes `gateway.conf` belongs here, not in a second copy. |
 | `profiles/*.profile` | Ready-made destination policies. Format documented in `profiles/README.md`. |
 | `templates/*.tmpl` | Rendered by `install.sh` with `@PLACEHOLDER@` substitution. |
@@ -117,8 +118,9 @@ can be re-applied without the clone it came from.
 ## Naming
 
 Interfaces are `in-<channel>` and `out-<egress>`. Routing tables are
-`gw_<egress>`. ipsets are `gwp_<rule>` for static CIDRs and `gwpd_<rule>` for
-what dnsmasq fills as names resolve. Config keys are
+`gw_<egress>`. ipsets are `gwp_<rule>` for static CIDRs, `gwpd_<rule>` for
+what dnsmasq fills as names resolve, and `gwpf_<rule>` for what `gw-feeds`
+fetches. Config keys are
 `INGRESS_<channel>_<FIELD>`, `EGRESS_<egress>_<FIELD>`,
 `POLICY_<rule>_<FIELD>` — read with bash indirect expansion (`${!var}`), which
 is why channel and egress names must match `^[a-z][a-z0-9_]*$`.
@@ -139,6 +141,13 @@ is why channel and egress names must match `^[a-z][a-z0-9_]*$`.
   line — silently, in a way that still validates. Config writes go through
   `conf_set` in `files/gw-lib.sh`, which escapes them; do not hand-roll another
   `sed -i "s|^KEY=.*|KEY=$value|"`.
+- **`ipset swap` refuses two sets whose creation parameters differ.** The
+  `gwpf_*` spec is written out in both `gw-feeds` and `gw-routes.sh` and the two
+  must stay identical; a mismatch shows up as a feed that appears to run and
+  never updates, not as an error anyone sees.
+- **`ip route get` does not apply mangle marks.** An unmarked probe only ever
+  shows the channel default, so it cannot tell you whether a policy rule works.
+  Read the mark off the rule that would have set it and pass `mark <n>`.
 - **dnsmasq's `bind-dynamic` device-binds every listener.** A packet arriving on
   one interface never reaches a socket bound to another, whatever its
   destination address says — so DNAT'ing a query to an address dnsmasq listens

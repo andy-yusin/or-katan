@@ -18,7 +18,7 @@ jobs:
           shellcheck -S warning \
             install.sh uninstall.sh setup.sh \
             files/gw-routes.sh files/gw-client files/gw-egress \
-            files/gw-config files/gw-doctor files/gw-lib.sh \
+            files/gw-config files/gw-doctor files/gw-lib.sh files/gw-feeds \
             test/run.sh test/shims/systemctl test/shims/awg test/shims/awg-quick
 
   install:
@@ -60,6 +60,9 @@ jobs:
           fi
           if grep -aq "FAILED to add" /tmp/out.log; then
             echo "a client could not be issued"; fail=1
+          fi
+          if grep -aq "FEED BROKEN" /tmp/out.log; then
+            echo "a policy feed did not load, or a failed fetch emptied its set"; fail=1
           fi
           [ "$fail" -eq 0 ] && echo "ok"
           exit "$fail"

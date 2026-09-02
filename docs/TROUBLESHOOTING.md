@@ -340,6 +340,46 @@ from the LAN, so do the two `dig`s above after any change.
 
 ---
 
+## A policy feed stopped updating
+
+The quiet one. Nothing breaks when a feed stops refreshing — the set keeps its
+last good contents and the rule goes on matching — so the list simply ages until
+someone notices traffic taking the wrong exit.
+
+```bash
+gw-feeds status                     # prefixes loaded, and how old
+systemctl status gw-feeds.timer     # is it even enabled
+journalctl -u gw-feeds -n 40        # what the last run said
+gw-feeds update <rule>              # run it now, verbosely
+```
+
+What it usually is:
+
+- **The source moved or 404s.** `gw-feeds update` says which URL did not answer.
+  List a second source: `POLICY_<rule>_FEED` takes several, tried in order.
+- **The download is being rejected as too short.** The message names the count
+  and the floor. If the list has genuinely shrunk, lower `POLICY_<rule>_FEED_MIN`
+  — but check first that the source has not simply broken, because that floor is
+  the only thing standing between a bad response and an emptied set.
+- **The fetch cannot reach the source at all.** It goes out whichever egress the
+  routing sends it to, so a feed can be a casualty of an exit being down. Check
+  `gw-doctor` first; the feed is rarely the actual problem.
+- **The timer is not enabled.** `gw-doctor` reports this outright. Re-running
+  `install.sh` recreates it — the unit is only written when a rule subscribes to
+  a feed, so it will not exist if `POLICY_<rule>_FEED` was never set.
+
+If the set is empty rather than stale, the list has never been fetched
+successfully. Check the cache: `/var/lib/gateway/feeds/<rule>.list` is written
+only on a successful update, and reloaded on every bring-up.
+
+One failure mode with no error message: `ipset swap` refuses two sets whose
+creation parameters differ, so if `gwpf_<rule>` was somehow created with a
+different `maxelem` or `hashsize`, every update fails silently at the last step.
+`ipset destroy gwpf_<rule>` and re-run `gw-routes.sh up <channel>` to recreate
+it with the right spec.
+
+---
+
 ## Large transfers stall, small requests are fine
 
 An MTU problem: something on the path is dropping the ICMP messages that

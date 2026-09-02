@@ -65,7 +65,9 @@ ok "routing tables and rules cleared"
 
 step "Removing tools and units"
 rm -f /usr/local/bin/gw-client /usr/local/bin/gw-egress /usr/local/bin/gw-doctor \
-      /usr/local/bin/gw-config /usr/local/bin/gw-setup
+      /usr/local/bin/gw-config /usr/local/bin/gw-feeds /usr/local/bin/gw-setup
+systemctl disable --now gw-feeds.timer >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/gw-feeds.timer /etc/systemd/system/gw-feeds.service
 rm -rf /etc/systemd/system/wg-quick@in-*.service.d /etc/systemd/system/awg-quick@in-*.service.d
 rm -f /etc/systemd/system/dnscrypt-proxy.service.d/10-gateway.conf
 rm -f /etc/systemd/networkd.conf.d/10-keep-foreign-rules.conf
@@ -101,6 +103,9 @@ if [[ "$PURGE" == "yes" ]]; then
     # The timestamped backups hold the same private keys; a purge that left
     # them behind would not be one.
     rm -f /etc/wireguard/*.conf.bak-* /etc/amnezia/amneziawg/*.conf.bak-*
+    # Cached feed lists. Not secret, but they are gateway state and a purge
+    # that left them would repopulate the sets on the next install.
+    rm -rf /var/lib/gateway
     ok "deleted — every client config ever issued is now permanently invalid"
 else
     cat <<EOF

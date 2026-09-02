@@ -237,8 +237,9 @@ show_all() {
     echo
     echo "${CYAN}${BOLD}destination policy${NC}  ${DIM}$(conf_get POLICY_RULES 2>/dev/null)${NC}"
     for r in $(conf_get POLICY_RULES 2>/dev/null || true); do
-        printf '  %-10s -> %-10s %s\n' "$r" "$(conf_get "POLICY_${r}_EGRESS" 2>/dev/null)" \
-            "${DIM}$(conf_get "POLICY_${r}_DOMAINS" 2>/dev/null | cut -c1-52)${NC}"
+        printf '  %-10s -> %-10s %s%s\n' "$r" "$(conf_get "POLICY_${r}_EGRESS" 2>/dev/null)" \
+            "${DIM}$(conf_get "POLICY_${r}_DOMAINS" 2>/dev/null | cut -c1-44)${NC}" \
+            "$([[ -n "$(conf_get "POLICY_${r}_FEED" 2>/dev/null)" ]] && printf ' %s[feed]%s' "$DIM" "$NC")"
     done
     echo
     echo "${CYAN}${BOLD}dns${NC}"

@@ -89,6 +89,7 @@ pol_domains(){ cfg "POLICY_${1}_DOMAINS"; }
 pol_cidrs()  { cfg "POLICY_${1}_CIDRS"; }
 pol_set()    { echo "gwp_$1"; }      # static CIDR seeds
 pol_setd()   { echo "gwpd_$1"; }     # populated live by dnsmasq
+pol_setf()   { echo "gwpf_$1"; }     # fetched from POLICY_<rule>_FEED by gw-feeds
 
 default_egress() { echo "$EGRESS_PATHS" | awk '{print $1}'; }
 
@@ -276,6 +277,11 @@ ensure_global() {
         s="$(pol_set "$r")"
         ipset create "$s" hash:net family inet hashsize 1024 maxelem 65536 -exist
         ipset create "$(pol_setd "$r")" hash:net family inet hashsize 1024 maxelem 65536 timeout 86400 -exist
+        # Feed sets are bigger by orders of magnitude — a country allocation
+        # list runs to tens of thousands of prefixes. This spec must match the
+        # one in gw-feeds: `ipset swap` refuses two sets created differently,
+        # and the symptom is a feed that appears to run and never updates.
+        ipset create "$(pol_setf "$r")" hash:net family inet hashsize 4096 maxelem 262144 -exist
         local cidr
         for cidr in $(pol_cidrs "$r"); do
             ipset add "$s" "$cidr" -exist 2>/dev/null || log "WARN: bad CIDR in POLICY_${r}_CIDRS: $cidr"
@@ -287,6 +293,11 @@ ensure_global() {
             ip route replace "${pdns}/32" via "$DEF_GW" dev "$DEF_IF"
         done
     done
+
+    # ipsets live in the kernel, so a reboot empties them and the nightly timer
+    # would not refill them until it next fires. Reload the last good list from
+    # disk instead — no network, and a no-op when nothing has been fetched yet.
+    [[ -x /usr/local/bin/gw-feeds ]] && /usr/local/bin/gw-feeds restore >/dev/null 2>&1 || true
 
     # --- MSS clamping --------------------------------------------------------
     # Without it, tunnelled TCP blackholes anywhere PMTU discovery is broken.
@@ -485,6 +496,8 @@ setup_channel() {
             -m set --match-set "$(pol_set "$r")" dst -j MARK --set-mark "$(eg_mark "$target")/${MARK_MASK}"
         ipt_append_once mangle PREROUTING -i "$iface" \
             -m set --match-set "$(pol_setd "$r")" dst -j MARK --set-mark "$(eg_mark "$target")/${MARK_MASK}"
+        ipt_append_once mangle PREROUTING -i "$iface" \
+            -m set --match-set "$(pol_setf "$r")" dst -j MARK --set-mark "$(eg_mark "$target")/${MARK_MASK}"
     done
 
     # --- Reachability -------------------------------------------------------
@@ -595,6 +608,8 @@ teardown_channel() {
         ipt_delete_all mangle PREROUTING -i "$iface" -m set --match-set "$(pol_set "$r")" dst \
             -j MARK --set-mark "$(eg_mark "$target")/${MARK_MASK}"
         ipt_delete_all mangle PREROUTING -i "$iface" -m set --match-set "$(pol_setd "$r")" dst \
+            -j MARK --set-mark "$(eg_mark "$target")/${MARK_MASK}"
+        ipt_delete_all mangle PREROUTING -i "$iface" -m set --match-set "$(pol_setf "$r")" dst \
             -j MARK --set-mark "$(eg_mark "$target")/${MARK_MASK}"
     done
 

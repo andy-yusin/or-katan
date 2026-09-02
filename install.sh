@@ -62,7 +62,7 @@ source "$CONF_SRC"
 : "${DNS_STACK:=yes}"; : "${DNS_FILTER_ENABLE:=yes}"; : "${DNS_FILTER_VERSION:=v0.107.68}"
 : "${DNS_FILTER_UI_PORT:=80}"; : "${DNS_EGRESS:=}"; : "${DNS_FALLBACK:=8.8.8.8}"
 : "${DNSCRYPT_RESOLVERS:=google}"; : "${SSH_PORT:=22}"; : "${IPV6_HARDEN:=no}"
-: "${DNS_LAN_CLIENTS:=}"
+: "${DNS_LAN_CLIENTS:=}"; : "${POLICY_FEED_SCHEDULE:=daily}"
 
 cfg() { local v="$1"; echo "${!v-}"; }
 ch_type()  { local t; t="$(cfg "INGRESS_${1}_TYPE")"; echo "${t:-wg}"; }
@@ -128,11 +128,33 @@ for e in $EGRESS_PATHS; do
     [[ " ${seen_ports} " == *" ${p} "* ]] && die "egress '${e}' listen port ${p} collides with an ingress port"
     seen_ports="${seen_ports} ${p}"
 done
+FEED_RULES=""
 for r in $POLICY_RULES; do
     valid_name "$r" || die "policy name '${r}' must be lowercase [a-z0-9_]"
     e="$(cfg "POLICY_${r}_EGRESS")"
     [[ " ${EGRESS_PATHS} " == *" ${e} "* ]] || die "policy '${r}' names undeclared egress '${e}'"
+    # A feed is a list of CIDRs fetched on a timer. It is the only part of a
+    # policy rule that reaches the network on its own, so the URLs are checked
+    # here rather than discovered at 3am by a unit nobody is watching.
+    feed="$(cfg "POLICY_${r}_FEED")"
+    if [[ -n "$feed" ]]; then
+        for u in $feed; do
+            [[ "$u" =~ ^(https?|file)://[^[:space:]]+$ ]] \
+                || die "POLICY_${r}_FEED entry '${u}' must be an http, https or file URL"
+            if [[ "$u" =~ ^http:// ]]; then
+                warn "POLICY_${r}_FEED '${u}' is plain http — whoever can rewrite that response chooses your routing"
+            fi
+        done
+        m="$(cfg "POLICY_${r}_FEED_MIN")"
+        [[ -z "$m" || "$m" =~ ^[0-9]+$ ]] || die "POLICY_${r}_FEED_MIN must be a number"
+        FEED_RULES="${FEED_RULES}${FEED_RULES:+ }${r}"
+    fi
 done
+# Quoted into a variable: an unquoted =~ pattern containing a space does not
+# parse as one regex.
+sched_re='^[A-Za-z0-9:*,/. -]+$'
+[[ -z "$FEED_RULES" || "$POLICY_FEED_SCHEDULE" =~ $sched_re ]] \
+    || die "POLICY_FEED_SCHEDULE is not a systemd OnCalendar expression"
 [[ -z "$DNS_EGRESS" || " ${EGRESS_PATHS} " == *" ${DNS_EGRESS} "* ]] \
     || die "DNS_EGRESS '${DNS_EGRESS}' is not a declared egress"
 
@@ -265,8 +287,9 @@ install -m 755 "${KIT_DIR}/files/gw-client" /usr/local/bin/gw-client
 install -m 755 "${KIT_DIR}/files/gw-egress" /usr/local/bin/gw-egress
 install -m 755 "${KIT_DIR}/files/gw-doctor" /usr/local/bin/gw-doctor
 install -m 755 "${KIT_DIR}/files/gw-config" /usr/local/bin/gw-config
+install -m 755 "${KIT_DIR}/files/gw-feeds" /usr/local/bin/gw-feeds
 install -m 755 "${KIT_DIR}/setup.sh" /usr/local/bin/gw-setup
-ok "config at ${CONF_DST}; tools: gw-client, gw-egress, gw-config, gw-doctor, gw-setup"
+ok "config at ${CONF_DST}; tools: gw-client, gw-egress, gw-config, gw-doctor, gw-feeds, gw-setup"
 
 # Keys live outside the interface configs so re-running the installer never
 # rotates them — that would silently invalidate every client config ever issued.
@@ -709,6 +732,56 @@ fi
 if [[ "$DNS_STACK" == "yes" ]]; then
     start_unit dnscrypt-proxy; ok "dnscrypt-proxy up"
     start_unit dnsmasq;        ok "dnsmasq up"
+fi
+
+# --- Policy feeds ------------------------------------------------------------
+# Written only when a rule actually subscribes to one, and removed when the last
+# one goes away, so a gateway with no feeds carries no timer for them.
+if [[ -n "$FEED_RULES" ]]; then
+    cat > /etc/systemd/system/gw-feeds.service <<'EOF'
+[Unit]
+Description=Refresh the address lists destination-policy rules subscribe to
+# The fetch goes out whichever egress the routing sends it to, so it has to wait
+# for routing to exist. It is not Requires=: a feed that cannot run must not
+# hold up the gateway coming back.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/gw-feeds update
+EOF
+    cat > /etc/systemd/system/gw-feeds.timer <<EOF
+[Unit]
+Description=Refresh destination-policy address lists (${POLICY_FEED_SCHEDULE})
+
+[Timer]
+OnCalendar=${POLICY_FEED_SCHEDULE}
+# Everyone pointed at the same public list would otherwise hit it on the same
+# second. Also catches up after downtime rather than skipping a day.
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now gw-feeds.timer >/dev/null 2>&1 || true
+    ok "policy feeds: ${FEED_RULES} (${POLICY_FEED_SCHEDULE})"
+    # Populate immediately rather than leaving the sets empty until the timer
+    # first fires — an empty feed set means every destination it covers takes
+    # the channel default instead of the rule's egress. (--check-only never
+    # reaches here; it exits during validation.)
+    if /usr/local/bin/gw-feeds update >/dev/null 2>&1; then
+        ok "policy feeds loaded"
+    else
+        warn "policy feeds could not be fetched yet — run 'gw-feeds update' to retry"
+    fi
+elif [[ -f /etc/systemd/system/gw-feeds.timer ]]; then
+    systemctl disable --now gw-feeds.timer >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/gw-feeds.timer /etc/systemd/system/gw-feeds.service
+    systemctl daemon-reload
+    ok "policy feeds: none configured, timer removed"
 fi
 for c in $INGRESS_CHANNELS; do
     if [[ "$(conf_changed "$(ch_conf "$c")")" == "yes" ]]; then

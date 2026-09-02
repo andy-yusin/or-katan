@@ -17,6 +17,35 @@ see what it makes of your config without changing the box.
 
 ## [Unreleased]
 
+### Added
+
+- **Policy feeds.** A destination-policy rule can subscribe to a published CIDR
+  list, refreshed on a systemd timer into a third ipset (`gwpf_<rule>`) that
+  matches exactly like the static and dnsmasq-filled ones. For rules that need
+  addresses in numbers nobody maintains by hand — a country's allocations, a
+  large provider's ranges.
+
+  It fails closed, which is the whole design: sources are tried in order, a
+  download shorter than `FEED_MIN` is treated as a failure rather than a shorter
+  list, and on any failure the previously loaded list stays in place. An emptied
+  set would silently reroute every destination it covered. Private, loopback,
+  link-local and multicast ranges are dropped whatever the source says, the swap
+  into the live set is atomic, and the last good list is cached on disk so a
+  reboot does not leave the set empty until the timer next fires.
+
+  New tool `gw-feeds` (`update` / `restore` / `status`). `gw-doctor` reports the
+  set size, how long since the last successful refresh, and whether the timer is
+  enabled.
+
+### Config
+
+- Added `POLICY_<rule>_FEED` — space-separated http, https or file URLs, tried
+  in order.
+- Added `POLICY_<rule>_FEED_MIN` — the floor below which a download counts as a
+  failure. Default 100.
+- Added `POLICY_FEED_SCHEDULE` — any systemd `OnCalendar` expression. Default
+  `daily`, with an hour of randomised delay.
+
 ## [0.1.0] — 2026-09-01
 
 First tagged release. The kit had been running a real gateway for a while; this

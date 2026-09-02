@@ -1,0 +1,203 @@
+#!/bin/bash
+#
+# gw-feeds — refresh the address lists that destination-policy rules subscribe
+# to, and reload them after a reboot.
+#
+#   gw-feeds update [rule...]   fetch, validate and swap in a new list
+#   gw-feeds restore            repopulate the sets from the last good lists
+#   gw-feeds status             what is loaded, and how old it is
+#
+# A policy rule matches on three sets, in increasing order of size:
+#
+#   gwp_<rule>    the CIDRs written in gateway.conf — small, static, always
+#                 present because gw-routes.sh rebuilds it from config
+#   gwpd_<rule>   what dnsmasq drops in as the rule's domains resolve
+#   gwpf_<rule>   this file: a list fetched from POLICY_<rule>_FEED
+#
+# The feed exists for destinations reached by address before any name is
+# resolved, in numbers too large to hand-maintain — a country's allocations, a
+# provider's ranges. Nothing else about the rule changes: the mark, the egress
+# and the iptables rules are the same whichever set matched.
+#
+# Failing closed here means keeping the list that is already loaded. A feed that
+# 404s, returns an error page, or comes back suspiciously short must never be
+# allowed to empty the set — that would silently reroute every destination it
+# covers, which on a policy rule pointing at the local uplink means quietly
+# sending domestic traffic through a foreign exit.
+set -euo pipefail
+
+CONF_FILE="${GATEWAY_CONF:-/etc/gateway/gateway.conf}"
+STATE_DIR="/var/lib/gateway/feeds"
+LOCK_FILE="/run/gw-feeds.lock"
+
+# Must match the spec gw-routes.sh creates gwpf_* with. `ipset swap` refuses
+# two sets whose creation parameters differ, and the failure looks like a feed
+# that silently never updates.
+IPSET_SPEC=(hash:net family inet hashsize 4096 maxelem 262144)
+
+# A list this short is a truncated download or an error page, not a feed.
+DEFAULT_MIN=100
+
+# Never routable, and a feed containing 0.0.0.0/0 would blackhole the gateway.
+EXCLUDE_RE='^(0\.|10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|22[4-9]\.|2[3-5][0-9]\.)'
+CIDR_RE='^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$'
+
+RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; DIM=$'\033[2m'; NC=$'\033[0m'
+log()  { printf '%s\n' "$*" >&2; }
+ok()   { printf '  %s✓%s %s\n' "$GREEN" "$NC" "$*" >&2; }
+warn() { printf '  %s!%s %s\n' "$YELLOW" "$NC" "$*" >&2; }
+err()  { printf '  %s✗%s %s\n' "$RED" "$NC" "$*" >&2; }
+die()  { printf '%sERROR:%s %s\n' "$RED" "$NC" "$*" >&2; exit 1; }
+
+[[ $EUID -eq 0 ]] || die "must run as root"
+[[ -r "$CONF_FILE" ]] || die "config not readable: $CONF_FILE"
+# shellcheck disable=SC1090
+source "$CONF_FILE"
+: "${POLICY_RULES:=}"
+
+cfg()          { local v="$1"; echo "${!v-}"; }
+pol_feed()     { cfg "POLICY_${1}_FEED"; }
+pol_feed_min() { local m; m="$(cfg "POLICY_${1}_FEED_MIN")"; echo "${m:-$DEFAULT_MIN}"; }
+pol_setf()     { echo "gwpf_$1"; }
+state_file()   { echo "${STATE_DIR}/${1}.list"; }
+
+feed_rules() {
+    local r
+    for r in $POLICY_RULES; do
+        [[ -n "$(pol_feed "$r")" ]] && printf '%s\n' "$r"
+    done
+    return 0
+}
+
+# Strip comments and anything that is not a routable CIDR. Written to a file
+# rather than a variable: these lists run to tens of thousands of lines.
+sanitise() {
+    grep -oE '^[^#[:space:]]+' "$1" 2>/dev/null \
+        | grep -E "$CIDR_RE" \
+        | grep -vE "$EXCLUDE_RE" \
+        | sort -u || true
+}
+
+# Build a temporary set, then exchange it with the live one. The swap is what
+# makes this safe to run against a gateway carrying traffic: there is no window
+# in which the set is empty and the policy rule stops matching.
+load_set() {
+    local rule="$1" list="$2" count="$3"
+    local live tmp
+    live="$(pol_setf "$rule")"
+    tmp="${live}_new"
+
+    ipset create "$live" "${IPSET_SPEC[@]}" -exist
+    ipset destroy "$tmp" 2>/dev/null || true
+    if ! ipset create "$tmp" "${IPSET_SPEC[@]}"; then
+        err "${rule}: could not create the staging set"
+        return 1
+    fi
+
+    # ipset restore is one round trip instead of tens of thousands of execs.
+    if ! sed "s|^|add ${tmp} |" "$list" | ipset restore -exist; then
+        err "${rule}: the list was rejected by ipset"
+        ipset destroy "$tmp" 2>/dev/null || true
+        return 1
+    fi
+
+    ipset swap "$tmp" "$live"
+    ipset destroy "$tmp" 2>/dev/null || true
+    ok "${rule}: ${count} prefixes live in ${live}"
+    return 0
+}
+
+update_rule() {
+    local rule="$1"
+    local urls min tmpdir raw clean count url
+    urls="$(pol_feed "$rule")"
+    min="$(pol_feed_min "$rule")"
+    tmpdir="$(mktemp -d)"
+    raw="${tmpdir}/raw"; clean="${tmpdir}/clean"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmpdir'" RETURN
+
+    for url in $urls; do
+        if ! curl -sfL --connect-timeout 10 --max-time 120 "$url" -o "$raw"; then
+            warn "${rule}: ${url} did not answer"
+            continue
+        fi
+        sanitise "$raw" > "$clean"
+        count="$(wc -l < "$clean" | tr -d ' ')"
+        if [[ "$count" -lt "$min" ]]; then
+            warn "${rule}: ${url} returned ${count} prefixes, below the ${min} minimum"
+            continue
+        fi
+        if load_set "$rule" "$clean" "$count"; then
+            mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
+            cp "$clean" "$(state_file "$rule")"
+            return 0
+        fi
+        return 1
+    done
+
+    # Every source failed. The set keeps whatever it already had, which is the
+    # entire point — see the header.
+    local held
+    held="$(ipset list "$(pol_setf "$rule")" 2>/dev/null | grep -cE "$CIDR_RE")" || held=0
+    err "${rule}: every source failed; keeping the ${held} prefixes already loaded"
+    return 1
+}
+
+restore_rule() {
+    local rule="$1" sf count
+    sf="$(state_file "$rule")"
+    if [[ ! -s "$sf" ]]; then
+        # Not an error: nothing has been fetched yet, and the timer will.
+        ipset create "$(pol_setf "$rule")" "${IPSET_SPEC[@]}" -exist
+        return 0
+    fi
+    count="$(wc -l < "$sf" | tr -d ' ')"
+    load_set "$rule" "$sf" "$count"
+}
+
+cmd_update() {
+    local rules="$*" r rc=0
+    [[ -n "$rules" ]] || rules="$(feed_rules | tr '\n' ' ')"
+    [[ -n "${rules// /}" ]] || { log "no policy rule subscribes to a feed"; return 0; }
+    for r in $rules; do
+        [[ -n "$(pol_feed "$r")" ]] || { err "policy '${r}' has no POLICY_${r}_FEED"; rc=1; continue; }
+        update_rule "$r" || rc=1
+    done
+    return "$rc"
+}
+
+cmd_restore() {
+    local r
+    for r in $(feed_rules); do restore_rule "$r" || true; done
+    return 0
+}
+
+cmd_status() {
+    local r sf n age
+    printf '%-14s %10s %12s  %s\n' RULE PREFIXES AGE SOURCE
+    for r in $(feed_rules); do
+        n="$(ipset list "$(pol_setf "$r")" 2>/dev/null | grep -cE "$CIDR_RE")" || n=0
+        sf="$(state_file "$r")"
+        if [[ -f "$sf" ]]; then
+            age="$(( ( $(date +%s) - $(stat -c %Y "$sf" 2>/dev/null || echo 0) ) / 3600 ))h"
+        else
+            age="never"
+        fi
+        printf '%-14s %10s %12s  %s%s%s\n' "$r" "$n" "$age" \
+            "$DIM" "$(pol_feed "$r" | awk '{print $1}')" "$NC"
+    done
+    return 0
+}
+
+usage() {
+    sed -n '3,8p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+case "${1:-status}" in
+    update)  shift; exec 9>"$LOCK_FILE"; flock -n 9 || die "another run is in progress"; cmd_update "$@" ;;
+    restore) exec 9>"$LOCK_FILE"; flock -n 9 || exit 0; cmd_restore ;;
+    status)  cmd_status ;;
+    -h|--help|help) usage ;;
+    *) usage; exit 1 ;;
+esac

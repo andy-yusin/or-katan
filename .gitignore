@@ -1,5 +1,7 @@
-# Your real config. It holds egress private keys — never commit it.
+# Your real config. It holds egress private keys — never commit it. The
+# timestamped backups the tools leave behind hold the same thing.
 gateway.conf
+gateway.conf.bak-*
 
 # Anything the tools emit locally.
 *.png

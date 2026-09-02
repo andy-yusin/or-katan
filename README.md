@@ -124,6 +124,10 @@ the path in the right country, national services out the local uplink so they
 stay fast and unblocked, everything else through the main exit. Matching is
 per-domain, not per-CIDR: dnsmasq drops each answer into an ipset as it
 resolves, so CDNs and rotating addresses are covered without maintaining lists.
+Where a rule needs addresses in numbers nobody maintains by hand — a country's
+allocations, a provider's ranges — it can subscribe to a published list instead,
+refreshed on a timer and built so a bad fetch keeps the last good one rather
+than emptying the set.
 
 Example — three groups, three ways out:
 
