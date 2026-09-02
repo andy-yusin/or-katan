@@ -56,6 +56,7 @@ because the next install regenerates it.
 | Path | What it is |
 |---|---|
 | `gateway.conf.example` | Every setting, documented. The schema lives here. |
+| `CHANGELOG.md` | What changed per release, and which config keys moved. |
 | `install.sh` | Validates the whole config, then makes the box match it. Idempotent. `--check-only` validates and exits. |
 | `setup.sh` | Interactive wizard that writes a `gateway.conf`. Installed as `gw-setup`. |
 | `uninstall.sh` | Reverses it. `--purge` also deletes keys and clients. |
@@ -174,6 +175,9 @@ addresses that never answer. See `test/README.md`.
 - Adding a config key: document it in `gateway.conf.example`, validate it in
   `install.sh`, and surface it in `gw-config show` if an operator would look
   for it.
+  Add it under **Unreleased → Config** in `CHANGELOG.md` too — `gateway.conf` is
+  the public interface, so a key appearing without a line there is the change
+  nobody upgrading will see coming.
 - Adding a moving part: add the `gw-doctor` check that says when it is broken.
 - Touching routing: `ip route get <dst> from <client-ip> iif in-<channel>`
   inside the test container answers exactly what a real kernel would. Assert

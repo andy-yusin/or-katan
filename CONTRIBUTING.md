@@ -15,6 +15,12 @@ CI runs exactly this on every push and pull request: shellcheck, plus all three
 fixtures in parallel. If it passes locally it will pass there, so there is no
 value in pushing to find out.
 
+If the change is one someone upgrading would notice — a new or changed config
+key, a fixed bug, different behaviour — add a line under **Unreleased** in
+[CHANGELOG.md](CHANGELOG.md), in the same commit. Config keys go in that
+section's **Config** subsection, because `gateway.conf` is what people actually
+depend on. Refactors and internal cleanups do not need an entry.
+
 ## What this project tries to be
 
 A gateway you can hand to someone who is not you, and have them run it without
