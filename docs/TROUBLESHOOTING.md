@@ -471,3 +471,42 @@ Carry these across to keep existing clients working:
 ```
 
 Then run `./install.sh` there — it preserves existing keys and clients.
+
+A snapshot carries all of it already, so the short version is: copy the newest
+`/var/backups/gateway/gateway-*.tar.gz` to the new host, `gw-backup restore
+<archive> --yes`, `./install.sh`. Treat that file the way you would treat the
+keys directory in transit — it is the keys directory, plus everything else.
+
+---
+
+## Restoring from a snapshot
+
+```bash
+gw-backup                              # what exists
+gw-backup show                         # what is in the newest one
+gw-backup restore gateway-<ts>.tar.gz  # what it would replace — changes nothing
+gw-backup restore gateway-<ts>.tar.gz --yes
+./install.sh                           # rebuild everything derived from it
+```
+
+A restore writes only the part nothing can regenerate: `/etc/gateway`,
+`AdGuardHome.yaml`, the cached feed lists. Interface configs, firewall rules,
+ipsets, routing tables and units are rebuilt by `install.sh` from what was
+restored — which is why the restore alone changes nothing that is running, and
+why you have to run the installer afterwards.
+
+It merges rather than wipes, so clients issued since the snapshot survive it,
+and it takes a snapshot of the current state before writing, so restoring the
+wrong archive is undoable. Without `--yes` it only prints what it would touch.
+
+**Nothing is being saved.** `gw-doctor` fails when the timer is off or no
+snapshot has ever been taken. `BACKUP_SCHEDULE="no"` turns it off deliberately;
+anything else is an `OnCalendar` expression.
+
+**The archive is readable.** `gw-doctor` fails on that too — the mode is the
+only thing between these files and every private key on the box, and nothing
+re-tightens it if it is loosened:
+
+```bash
+chmod 700 /var/backups/gateway && chmod 600 /var/backups/gateway/gateway-*.tar.gz
+```

@@ -1,0 +1,249 @@
+#!/bin/bash
+#
+# gw-backup — snapshot everything needed to rebuild this gateway, and put it
+# back.
+#
+#   gw-backup                    what snapshots exist
+#   gw-backup now                take one — this is what the timer runs
+#   gw-backup show [archive]     the manifest inside one (default: the newest)
+#   gw-backup restore <archive>  what restoring it would replace
+#   gw-backup restore <a> --yes  actually replace it
+#
+# ---------------------------------------------------------------------------
+# Source and derived
+# ---------------------------------------------------------------------------
+# Almost everything on a gateway is generated: interface configs, iptables
+# rules, ipsets, routing tables, systemd units. install.sh rebuilds all of it
+# from gateway.conf and the keys, which is what makes a restore small — put
+# back the few things nothing can regenerate, run the installer, and the rest
+# reappears identical.
+#
+# So the archive is in four parts. `config/` is that irreplaceable set and is
+# the only part a restore writes. `derived/` is what the installer rendered
+# last time, kept because comparing it against what the installer renders now
+# is the fastest way to see what a change actually did. `state/` is the live
+# kernel state — rules, routes, ipsets — which is worth having the moment
+# something is behaving differently than it did yesterday, and which restoring
+# would be meaningless. `extra/` is whatever BACKUP_EXTRA names: host
+# configuration this kit does not own, captured so the archive is enough to
+# rebuild the machine, and never written back — sshd_config from a month ago
+# arriving on a running box is how you lose the box.
+#
+# ---------------------------------------------------------------------------
+# The archive holds every private key on this box
+# ---------------------------------------------------------------------------
+# The gateway's own keys and every client's. It is exactly as sensitive as
+# /etc/gateway/keys and is written 0600 into a 0700 directory to match. That
+# protects it here and nowhere else: anything that copies these off the box —
+# rsync, an off-site job, a backup agent that walks /var — is moving the whole
+# gateway's credentials, and needs to be as careful with them as you would be
+# with the keys directory itself.
+set -euo pipefail
+
+CONF_FILE="${GATEWAY_CONF:-/etc/gateway/gateway.conf}"
+ETC_DIR="/etc/gateway"
+
+RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; BOLD=$'\033[1m'; DIM=$'\033[2m'; NC=$'\033[0m'
+log()  { printf '%s\n' "$*" >&2; }
+ok()   { printf '  %s✓%s %s\n' "$GREEN" "$NC" "$*" >&2; }
+warn() { printf '  %s!%s %s\n' "$YELLOW" "$NC" "$*" >&2; }
+die()  { printf '%sERROR:%s %s\n' "$RED" "$NC" "$*" >&2; exit 1; }
+
+[[ $EUID -eq 0 ]] || die "must run as root"
+[[ -r "$CONF_FILE" ]] || die "config not readable: $CONF_FILE"
+# shellcheck disable=SC1090
+source "$CONF_FILE"
+: "${BACKUP_DIR:=/var/backups/gateway}"
+: "${BACKUP_KEEP_DAYS:=30}"; : "${BACKUP_EXTRA:=}"
+: "${INGRESS_CHANNELS:=}"; : "${EGRESS_PATHS:=direct}"
+
+shopt -s nullglob
+
+# One scratch directory at a time, cleaned up whether the run finishes or dies.
+# A per-function trap would not do: `restore` calls `now` first, and the second
+# `trap ... EXIT` replaces the first, leaking the directory the first made.
+WORK=""
+trap 'if [[ -n "${WORK:-}" ]]; then rm -rf "$WORK"; fi' EXIT
+
+# What a rebuild cannot regenerate. The only part a restore writes.
+source_paths() {
+    printf '%s\n' \
+        "$ETC_DIR" \
+        /opt/AdGuardHome/AdGuardHome.yaml \
+        /var/lib/gateway/feeds
+}
+
+# What install.sh rendered from the above, last time it ran.
+derived_paths() {
+    printf '%s\n' \
+        /etc/wireguard \
+        /etc/amnezia \
+        /etc/dnsmasq.conf \
+        /etc/dnsmasq.d \
+        /etc/dnscrypt-proxy \
+        /etc/sysctl.d/99-gateway.conf \
+        /etc/systemd/networkd.conf.d/10-keep-foreign-rules.conf
+    printf '%s\n' /etc/systemd/system/gw-*.service /etc/systemd/system/gw-*.timer
+    printf '%s\n' /etc/systemd/system/wg-quick@in-*.service.d \
+                  /etc/systemd/system/awg-quick@in-*.service.d \
+                  /etc/systemd/system/dnscrypt-proxy.service.d
+}
+
+# Copy <path> under <root>, keeping its absolute location so the archive reads
+# like the filesystem and a restore is a plain copy back.
+snap() {
+    local root="$1" p="$2" d
+    [[ -e "$p" ]] || return 0
+    d="${root}$(dirname "$p")"
+    mkdir -p "$d"
+    cp -a "$p" "$d/" 2>/dev/null || warn "could not copy ${p}"
+    return 0
+}
+
+# Archives are named gateway-<date>-<time>, so a glob comes back in
+# chronological order and the last one is the newest. No ls parsing, and no
+# dependence on an mtime that a copy would change.
+newest() {
+    local a=("${BACKUP_DIR}"/gateway-*.tar.gz)
+    [[ ${#a[@]} -gt 0 ]] || return 1
+    printf '%s\n' "${a[${#a[@]}-1]}"
+}
+
+cmd_now() {
+    local tag work tar_out n
+    tag="$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
+    WORK="$(mktemp -d)"; work="$WORK"
+    tar_out="${BACKUP_DIR}/gateway-${tag}.tar.gz"
+
+    local p
+    while IFS= read -r p; do snap "${work}/config"  "$p"; done < <(source_paths)
+    while IFS= read -r p; do snap "${work}/derived" "$p"; done < <(derived_paths)
+    for p in $BACKUP_EXTRA; do snap "${work}/extra" "$p"; done
+
+    mkdir -p "${work}/state"
+    iptables-save            > "${work}/state/iptables.rules"      2>/dev/null || true
+    ip6tables-save           > "${work}/state/ip6tables.rules"     2>/dev/null || true
+    ipset save               > "${work}/state/ipset.rules"         2>/dev/null || true
+    ip rule show             > "${work}/state/ip-rule.txt"         2>/dev/null || true
+    ip route show table all  > "${work}/state/ip-route.txt"        2>/dev/null || true
+    ip -br addr show         > "${work}/state/ip-addr.txt"         2>/dev/null || true
+    # Public keys and handshake times only — `wg show` never prints a private
+    # key, and the peer list is what says which clients were live at the time.
+    { command -v wg  >/dev/null && wg show all  2>/dev/null; } > "${work}/state/wg.txt"  || true
+    { command -v awg >/dev/null && awg show all 2>/dev/null; } > "${work}/state/awg.txt" || true
+    systemctl list-timers --all --no-pager > "${work}/state/timers.txt" 2>/dev/null || true
+
+    cat > "${work}/manifest.txt" <<EOF
+host:      $(hostname)
+date:      $(date -Iseconds)
+kernel:    $(uname -r)
+gateway:   ${GATEWAY_HOST:-unset}
+channels:  ${INGRESS_CHANNELS}
+egresses:  ${EGRESS_PATHS}
+clients:   $(ls -1 "${ETC_DIR}/clients"/*.conf 2>/dev/null | wc -l | tr -d ' ')
+extra:     ${BACKUP_EXTRA:-none}
+restore:   config/ is what a restore writes; derived/, state/ and extra/ are for reading
+EOF
+
+    tar -czf "$tar_out" -C "$work" .
+    chmod 600 "$tar_out"
+
+    # Rotation runs after the new archive is written, so a run that fails
+    # leaves the old ones alone rather than clearing the shelf first.
+    find "$BACKUP_DIR" -maxdepth 1 -name 'gateway-*.tar.gz' -mtime "+${BACKUP_KEEP_DAYS}" -delete 2>/dev/null || true
+
+    n="$(du -h "$tar_out" | awk '{print $1}')"
+    logger -t gw-backup "wrote ${tar_out} (${n})" 2>/dev/null || true
+    ok "${tar_out} (${n})"
+    rm -rf "$work"; WORK=""
+}
+
+cmd_list() {
+    local a=("${BACKUP_DIR}"/gateway-*.tar.gz) f i
+    printf '%s%-34s %-10s %s%s\n' "$BOLD" ARCHIVE SIZE WHEN "$NC"
+    for (( i=${#a[@]}-1; i>=0; i-- )); do
+        f="${a[i]}"
+        printf '%-34s %-10s %s\n' "$(basename "$f")" \
+            "$(du -h "$f" | awk '{print $1}')" \
+            "$(date -r "$f" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?')"
+    done
+    [[ ${#a[@]} -gt 0 ]] || log "no snapshots in ${BACKUP_DIR}"
+    echo
+    printf '%skept for %s days; %s holds every private key on this box%s\n' \
+        "$DIM" "$BACKUP_KEEP_DAYS" "$BACKUP_DIR" "$NC"
+}
+
+cmd_show() {
+    local f="${1:-}"
+    [[ -n "$f" ]] || f="$(newest)" || die "no snapshots in ${BACKUP_DIR}"
+    [[ -f "$f" ]] || f="${BACKUP_DIR}/${f}"
+    [[ -r "$f" ]] || die "cannot read ${f}"
+    tar -xzOf "$f" ./manifest.txt 2>/dev/null || die "${f} has no manifest — is it a gateway snapshot?"
+    echo
+    printf '%swhat it holds%s\n' "$BOLD" "$NC"
+    tar -tzf "$f" | awk -F/ '/^\.\/(config|derived|state|extra)\//{print $2}' | sort | uniq -c \
+        | awk '{printf "  %-10s %s entries\n", $2, $1}'
+}
+
+cmd_restore() {
+    local f="" yes=no a
+    for a in "$@"; do
+        case "$a" in
+            --yes) yes=yes ;;
+            *) [[ -z "$f" ]] && f="$a" || die "unexpected argument: $a" ;;
+        esac
+    done
+    [[ -n "$f" ]] || die "usage: gw-backup restore <archive> [--yes]"
+    [[ -f "$f" ]] || f="${BACKUP_DIR}/${f}"
+    [[ -r "$f" ]] || die "cannot read ${f}"
+    local listing
+    listing="$(tar -tzf "$f")"
+    grep -q '^\./config/' <<< "$listing" || die "${f} has no config/ — is it a gateway snapshot?"
+
+    if [[ "$yes" != yes ]]; then
+        # Named from the same list the snapshot was built from, rather than
+        # guessed from path depth: what is written back is exactly this set.
+        local p
+        log "${BOLD}Restoring ${f} would write over:${NC}"
+        while IFS= read -r p; do
+            grep -q "^\./config${p}" <<< "$listing" && log "  ${p}"
+        done < <(source_paths)
+        log ""
+        log ""
+        log "Files that exist now and are not in the archive are left alone — this"
+        log "merges, it does not wipe. Clients issued since the snapshot survive."
+        grep -q '^\./extra/' <<< "$listing" \
+            && log "extra/ is in the archive and is not written back — unpack it by hand."
+        log ""
+        log "  gw-backup restore $(basename "$f") --yes"
+        return 0
+    fi
+
+    # The undo. A restore that silently replaced the running keys with older
+    # ones, with nothing to go back to, would be worse than no restore at all.
+    log "taking a snapshot of the current state first..."
+    cmd_now
+
+    local work
+    WORK="$(mktemp -d)"; work="$WORK"
+    tar -xzf "$f" -C "$work" ./config
+    cp -a "${work}/config/." /
+    rm -rf "$work"; WORK=""
+    ok "restored from $(basename "$f")"
+    log ""
+    log "Nothing is live yet: interface configs, firewall rules and units are"
+    log "rebuilt from what was just restored. Run:"
+    log "  ${BOLD}${ETC_DIR}/install.sh${NC}"
+}
+
+usage() { sed -n '3,10p' "$0" | sed 's/^# \{0,1\}//'; }
+
+case "${1:-list}" in
+    now)     cmd_now ;;
+    list)    cmd_list ;;
+    show)    shift; cmd_show "$@" ;;
+    restore) shift; cmd_restore "$@" ;;
+    -h|--help|help) usage ;;
+    *) usage; exit 1 ;;
+esac

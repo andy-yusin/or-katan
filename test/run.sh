@@ -159,6 +159,42 @@ if grep -q "^EGRESS_[a-z_]*_FAILOVER=" /work/gateway.conf; then
 fi
 
 echo
+echo "==> snapshots"
+# Taken by the installer already; this asserts what is in it and that putting
+# it back works, which is the only thing that makes a backup worth having.
+arc=$(ls -1t /var/backups/gateway/gateway-*.tar.gz 2>/dev/null | head -1)
+if [ -z "$arc" ]; then
+    echo "  BACKUP BROKEN: the installer took no snapshot"
+else
+    [ "$(stat -c %a "$arc")" = "600" ] && [ "$(stat -c %a /var/backups/gateway)" = "700" ] \
+        && echo "  archive is 0600 in a 0700 directory" \
+        || echo "  BACKUP BROKEN: $(stat -c %a /var/backups/gateway)/$(stat -c %a "$arc") — key material is readable"
+    for want in ./config/etc/gateway/gateway.conf ./manifest.txt ./state/iptables.rules; do
+        tar -tzf "$arc" | grep -qx "$want" || echo "  BACKUP BROKEN: ${want} is not in the archive"
+    done
+    tar -tzf "$arc" | grep -qx ./config/etc/gateway/gateway.conf && echo "  holds the config, manifest and live state"
+    # A restore has to actually put a changed file back.
+    was=$(gw-config get GATEWAY_HOST)
+    gw-config --no-apply set GATEWAY_HOST "wrecked.example" >/dev/null 2>&1 || true
+    gw-backup restore "$arc" >/dev/null 2>&1 || true
+    [ "$(gw-config get GATEWAY_HOST)" = "wrecked.example" ] \
+        && echo "  a restore without --yes changes nothing" \
+        || echo "  BACKUP BROKEN: restore wrote without being asked to"
+    gw-backup restore "$arc" --yes >/dev/null 2>&1 || true
+    [ "$(gw-config get GATEWAY_HOST)" = "$was" ] \
+        && echo "  restore --yes puts the config back" \
+        || echo "  BACKUP BROKEN: after restore GATEWAY_HOST is $(gw-config get GATEWAY_HOST), expected ${was}"
+    if grep -q '^BACKUP_EXTRA="/' /work/gateway.conf; then
+        tar -tzf "$arc" | grep -q '^\./extra/' \
+            && echo "  BACKUP_EXTRA landed in extra/, outside what a restore writes" \
+            || echo "  BACKUP BROKEN: BACKUP_EXTRA is set but extra/ is empty"
+    fi
+    n=$(ls -1 /var/backups/gateway/gateway-*.tar.gz | wc -l | tr -d ' ')
+    [ "$n" -ge 2 ] && echo "  restore took its own snapshot first (${n} on disk)" \
+                   || echo "  BACKUP BROKEN: restore did not snapshot what it was about to overwrite"
+fi
+
+echo
 echo "==> idempotency: install again, rule counts must not move"
 before="$(ip rule show | wc -l):$(iptables-save | wc -l):$(ip -o link show | wc -l)"
 ./install.sh > /tmp/install2.log 2>&1 || { echo "REINSTALL FAILED"; tail -20 /tmp/install2.log; exit 1; }

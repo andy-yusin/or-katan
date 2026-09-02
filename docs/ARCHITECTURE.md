@@ -261,6 +261,32 @@ By measurement, not reputation. These queries leave via `DNS_EGRESS`, so a
 resolver 5 ms from you may be hundreds of ms from that exit — and every uncached
 lookup for every client pays it. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
+## Snapshots
+
+Almost everything on a gateway is generated. `install.sh` renders the interface
+configs, `gw-routes.sh` builds the firewall, routing tables and ipsets, and the
+units come from the installer — all of it from `gateway.conf` and the keys. So
+what a backup has to preserve is small, and losing it is unrecoverable: without
+`/etc/gateway/keys` every client config ever issued is dead.
+
+`gw-backup` splits the archive along that line. `config/` is the irreplaceable
+set — `/etc/gateway`, `AdGuardHome.yaml`, the cached feed lists — and is the
+only part a restore writes. `derived/` is what the installer rendered last
+time, kept because diffing it against what the installer renders now is the
+quickest way to see what a change actually did. `state/` is live kernel state:
+`iptables-save`, `ipset save`, `ip rule`, `ip route show table all`. Restoring
+it would be meaningless; having it the morning after something changed is not.
+
+A restore is therefore two steps — put `config/` back, run `install.sh` — and
+it takes its own snapshot first, so replacing the running keys with older ones
+is undoable.
+
+The archive holds every private key on the box, the gateway's and every
+client's. It is written 0600 into a 0700 directory to match
+`/etc/gateway/keys`, and `gw-doctor` checks both modes because nothing
+re-tightens them. That protects the archive here and nowhere else: whatever
+copies it off the box is moving the whole gateway's credentials.
+
 ## Files
 
 | Path | What |
@@ -277,6 +303,7 @@ lookup for every client pays it. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 | `*.conf.bak-<timestamp>` | the previous interface config, kept only when one actually changed; the last three survive. Private keys — treat them as live |
 | `/var/lib/gateway/feeds/<rule>.list` | the last list a policy feed accepted |
 | `/var/lib/gateway/health/substitutions` | which path is carrying which, while a failover is in force |
+| `/var/backups/gateway/gateway-<ts>.tar.gz` | a snapshot. Holds every private key on the box — 0600, in a 0700 directory |
 
 `gw-routes.sh` is idempotent and safe to run by hand — it is the recovery path
 whenever routing state is flushed:

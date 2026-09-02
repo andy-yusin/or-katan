@@ -66,6 +66,8 @@ source "$CONF_SRC"
 : "${HEALTH_TARGETS:=https://1.1.1.1 https://8.8.8.8}"; : "${HEALTH_INTERVAL:=30}"
 : "${HEALTH_TIMEOUT:=5}"; : "${HEALTH_THRESHOLD:=2}"; : "${HEALTH_COOLDOWN:=120}"
 : "${HEALTH_FAILBACK:=no}"
+: "${BACKUP_SCHEDULE:=daily}"; : "${BACKUP_DIR:=/var/backups/gateway}"
+: "${BACKUP_KEEP_DAYS:=30}"; : "${BACKUP_EXTRA:=}"
 
 cfg() { local v="$1"; echo "${!v-}"; }
 ch_type()  { local t; t="$(cfg "INGRESS_${1}_TYPE")"; echo "${t:-wg}"; }
@@ -195,6 +197,24 @@ if [[ -n "$FAILOVER_EGRESSES" ]]; then
     worst=$(( $(wc -w <<< "$EGRESS_PATHS") * $(wc -w <<< "$HEALTH_TARGETS") * HEALTH_TIMEOUT ))
     [[ "$worst" -le "$HEALTH_INTERVAL" ]] \
         || warn "a slow check can take ${worst}s but HEALTH_INTERVAL is ${HEALTH_INTERVAL}s — raise the interval or lower HEALTH_TIMEOUT"
+fi
+
+# Snapshots are on unless turned off: the thing they protect against is losing
+# the one directory nothing else can regenerate, and a gateway that has never
+# been backed up looks exactly like one that has.
+if [[ "$BACKUP_SCHEDULE" != "no" ]]; then
+    [[ "$BACKUP_SCHEDULE" =~ $sched_re ]] \
+        || die "BACKUP_SCHEDULE is not a systemd OnCalendar expression (or \"no\" to turn snapshots off)"
+    # /*/* rather than /*: --purge deletes this directory, and "/" or "/var"
+    # arriving here through a typo would make that a very different command.
+    [[ "$BACKUP_DIR" == /*/* ]] \
+        || die "BACKUP_DIR must be an absolute path at least one directory deep, e.g. /var/backups/gateway — got '${BACKUP_DIR}'"
+    [[ "$BACKUP_KEEP_DAYS" =~ ^[0-9]+$ && "$BACKUP_KEEP_DAYS" -gt 0 ]] \
+        || die "BACKUP_KEEP_DAYS must be a positive number, got '${BACKUP_KEEP_DAYS}'"
+    for x in $BACKUP_EXTRA; do
+        [[ "$x" == /* ]] || die "BACKUP_EXTRA entry '${x}' must be an absolute path"
+        [[ -e "$x" ]] || warn "BACKUP_EXTRA names '${x}', which does not exist — snapshots will skip it"
+    done
 fi
 
 # Serving DNS to the uplink side is useful and sharp-edged in equal measure:
@@ -328,8 +348,9 @@ install -m 755 "${KIT_DIR}/files/gw-doctor" /usr/local/bin/gw-doctor
 install -m 755 "${KIT_DIR}/files/gw-config" /usr/local/bin/gw-config
 install -m 755 "${KIT_DIR}/files/gw-feeds" /usr/local/bin/gw-feeds
 install -m 755 "${KIT_DIR}/files/gw-health" /usr/local/bin/gw-health
+install -m 755 "${KIT_DIR}/files/gw-backup" /usr/local/bin/gw-backup
 install -m 755 "${KIT_DIR}/setup.sh" /usr/local/bin/gw-setup
-ok "config at ${CONF_DST}; tools: gw-client, gw-egress, gw-config, gw-doctor, gw-feeds, gw-health, gw-setup"
+ok "config at ${CONF_DST}; tools: gw-client, gw-egress, gw-config, gw-doctor, gw-feeds, gw-health, gw-backup, gw-setup"
 
 # Keys live outside the interface configs so re-running the installer never
 # rotates them — that would silently invalidate every client config ever issued.
@@ -879,6 +900,48 @@ elif [[ -f /etc/systemd/system/gw-health.timer ]]; then
     rm -f /etc/systemd/system/gw-health.timer /etc/systemd/system/gw-health.service
     systemctl daemon-reload
     ok "egress failover: none configured, timer removed"
+fi
+
+# --- Snapshots ---------------------------------------------------------------
+if [[ "$BACKUP_SCHEDULE" != "no" ]]; then
+    cat > /etc/systemd/system/gw-backup.service <<'EOF'
+[Unit]
+Description=Snapshot this gateway's configuration and live state
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/gw-backup now
+EOF
+    cat > /etc/systemd/system/gw-backup.timer <<EOF
+[Unit]
+Description=Gateway snapshot (${BACKUP_SCHEDULE})
+
+[Timer]
+OnCalendar=${BACKUP_SCHEDULE}
+RandomizedDelaySec=15m
+# A box that was off at the scheduled time takes its snapshot when it comes
+# back, rather than skipping the day.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now gw-backup.timer >/dev/null 2>&1 || true
+    ok "snapshots: ${BACKUP_SCHEDULE} to ${BACKUP_DIR}, kept ${BACKUP_KEEP_DAYS} days"
+    # Take one now, so the configuration that was just applied is already
+    # saved rather than waiting for the first scheduled run.
+    if /usr/local/bin/gw-backup now >/dev/null 2>&1; then
+        ok "snapshot taken — it holds every private key on this box, mode 0600"
+    else
+        warn "the first snapshot failed — run 'gw-backup now' to see why"
+    fi
+elif [[ -f /etc/systemd/system/gw-backup.timer ]]; then
+    systemctl disable --now gw-backup.timer >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/gw-backup.timer /etc/systemd/system/gw-backup.service
+    systemctl daemon-reload
+    ok "snapshots: off (BACKUP_SCHEDULE=no), timer removed"
 fi
 
 # =============================================================================

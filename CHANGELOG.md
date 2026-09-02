@@ -60,6 +60,25 @@ see what it makes of your config without changing the box.
   when the original is answering again, and `gw-egress` no longer reads a live
   failover as a leak.
 
+- **Snapshots.** `gw-backup`, on a daily timer, saves what a rebuild cannot
+  regenerate and can put it back. Everything else on a gateway is generated
+  from `gateway.conf` and the keys, so the archive is split along that line:
+  `config/` (`/etc/gateway`, `AdGuardHome.yaml`, the cached feed lists) is the
+  only part a restore writes, `derived/` is what the installer rendered last
+  time — worth diffing against what it renders now — and `state/` is
+  `iptables-save`, `ipset save`, `ip rule` and the routing tables, which are
+  worth reading the morning after something changed and meaningless to restore.
+
+  A restore takes its own snapshot before writing, so replacing the running
+  keys with older ones is undoable; it merges rather than wipes, so clients
+  issued since survive it; and without `--yes` it only prints what it would
+  touch. Afterwards `install.sh` rebuilds everything derived.
+
+  The archive holds every private key on the box. It is written 0600 into a
+  0700 directory to match `/etc/gateway/keys`, `gw-doctor` checks both modes
+  and the age of the newest snapshot, and `uninstall.sh --purge` deletes the
+  directory — a purge that left a tarball of every key behind would not be one.
+
 ### Changed
 
 - `gw-routes.sh` accepts `ensure`, which re-asserts the global routing state
@@ -83,6 +102,12 @@ see what it makes of your config without changing the box.
 - Added `HEALTH_TARGETS` (default `https://1.1.1.1 https://8.8.8.8`),
   `HEALTH_INTERVAL` (30s), `HEALTH_TIMEOUT` (5s), `HEALTH_THRESHOLD` (2),
   `HEALTH_COOLDOWN` (120s) and `HEALTH_FAILBACK` (`no`).
+- Added `BACKUP_SCHEDULE` — any systemd `OnCalendar` expression, or `no` to
+  take no snapshots. **Defaults to `daily`**, so an upgrade starts writing
+  snapshots to `BACKUP_DIR` without being asked: they contain private keys, and
+  0600 in a 0700 directory is all that protects them.
+- Added `BACKUP_DIR` (default `/var/backups/gateway`) and `BACKUP_KEEP_DAYS`
+  (30).
 
 ## [0.1.0] — 2026-09-01
 

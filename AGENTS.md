@@ -67,6 +67,7 @@ because the next install regenerates it.
 | `files/gw-doctor` | Layered health check. Start here when debugging. |
 | `files/gw-feeds` | Fetches the address lists policy rules subscribe to. Run by a timer. |
 | `files/gw-health` | Probes each egress path and carries a failed one on another. Run by a timer. |
+| `files/gw-backup` | Snapshots what a rebuild needs, and restores it. Run by a timer. Its archives hold every private key on the box. |
 | `files/gw-lib.sh` | Helpers used by more than one tool: the config writer (`gw-config`, `gw-egress`) and the failover-substitution reader (`gw-egress`, `gw-doctor`). Sourced, never run. Anything that writes `gateway.conf` belongs here, not in a second copy. |
 | `profiles/*.profile` | Ready-made destination policies. Format documented in `profiles/README.md`. |
 | `templates/*.tmpl` | Rendered by `install.sh` with `@PLACEHOLDER@` substitution. |

@@ -30,6 +30,7 @@ source "$LIB"
 : "${INGRESS_CHANNELS:=}"; : "${EGRESS_PATHS:=direct}"; : "${POLICY_RULES:=}"
 : "${DNS_STACK:=yes}"; : "${DNS_FILTER_ENABLE:=yes}"; : "${GATEWAY_HOST:=}"
 : "${DNS_EGRESS:=}"; : "${DNS_LAN_CLIENTS:=}"; : "${HEALTH_FAILBACK:=no}"
+: "${BACKUP_SCHEDULE:=daily}"; : "${BACKUP_DIR:=/var/backups/gateway}"
 
 # Asked once: every section that reports where traffic goes has to agree about
 # a failover in force, or a working substitution reads as a fault.
@@ -176,6 +177,32 @@ else
                  "gw-health back ${e}"
         fi
     done <<< "$SUBS"
+fi
+fi
+
+# ---------------------------------------------------------------------------
+if [[ "$BACKUP_SCHEDULE" != "no" ]]; then
+section "snapshots"
+systemctl is-enabled --quiet gw-backup.timer 2>/dev/null \
+    && pass "gw-backup.timer enabled" \
+    || fail "gw-backup.timer is not enabled — nothing is being saved" "re-run install.sh"
+newest="$(ls -1t "${BACKUP_DIR}"/gateway-*.tar.gz 2>/dev/null | head -1)"
+if [[ -z "$newest" ]]; then
+    fail "no snapshot has ever been taken" "gw-backup now"
+else
+    age=$(( ( $(date +%s) - $(stat -c %Y "$newest" 2>/dev/null || echo 0) ) / 86400 ))
+    [[ "$age" -le 7 ]] && pass "newest snapshot is ${age}d old ($(basename "$newest"))" \
+                       || warn "newest snapshot is ${age}d old" "systemctl status gw-backup.timer; gw-backup now"
+    # The only thing standing between these archives and every private key on
+    # the box is their mode. Nothing re-tightens it if it is loosened.
+    dperm="$(stat -c %a "$BACKUP_DIR" 2>/dev/null || echo '?')"
+    fperm="$(stat -c %a "$newest" 2>/dev/null || echo '?')"
+    [[ "$dperm" == "700" ]] && pass "${BACKUP_DIR} is 0700" \
+                            || fail "${BACKUP_DIR} is ${dperm}, expected 700" "chmod 700 ${BACKUP_DIR}"
+    loose="$(find "$BACKUP_DIR" -maxdepth 1 -name 'gateway-*.tar.gz' ! -perm 600 2>/dev/null | wc -l | tr -d ' ')"
+    [[ "$loose" == "0" ]] && pass "snapshots are 0600 (newest: ${fperm})" \
+                          || fail "${loose} snapshot(s) are not 0600 — they hold every private key" \
+                                  "chmod 600 ${BACKUP_DIR}/gateway-*.tar.gz"
 fi
 fi
 

@@ -227,6 +227,8 @@ See [profiles/README.md](profiles/README.md).
 | `gw-config profile ru` | swap the destination policy wholesale |
 | `gw-health` | which paths are answering, and what is standing in for what |
 | `gw-health back main` | end a failover once the path is working again |
+| `gw-backup` | snapshots taken, and how old |
+| `gw-backup restore <archive>` | put back what a rebuild needs (`--yes` to commit) |
 | `gw-doctor` | check every layer |
 
 Anything that changes the config validates first, and rolls back if *either*

@@ -311,6 +311,35 @@ DNS_LAN_CLIENTS=""
 
 
 # =============================================================================
+# SNAPSHOTS — what a rebuild needs, saved on a timer
+# =============================================================================
+# Almost everything here is generated: interface configs, firewall rules,
+# ipsets, routing tables, units. install.sh rebuilds all of it from
+# gateway.conf and the keys, so what a snapshot has to preserve is small — and
+# irreplaceable. Lose /etc/gateway and every client config ever issued is dead,
+# because the keys they were signed against are gone.
+#
+# The archive therefore holds every private key on this box, the gateway's and
+# every client's. It is written 0600 into a 0700 directory, which protects it
+# here and nowhere else: whatever copies it off the box is moving the whole
+# gateway's credentials.
+#
+# Any systemd OnCalendar expression, or "no" to take none.
+BACKUP_SCHEDULE="daily"
+BACKUP_DIR="/var/backups/gateway"
+BACKUP_KEEP_DAYS="30"
+
+# Host configuration this kit does not own but you would want if the machine
+# had to be rebuilt — sshd, fail2ban, whatever else you have edited. Captured
+# into the archive and never written back by a restore: an sshd_config from a
+# month ago arriving on a running box is how you lose the box. Unpack what you
+# want from extra/ yourself.
+#
+#   BACKUP_EXTRA="/etc/ssh/sshd_config /etc/ssh/sshd_config.d /etc/fail2ban/jail.d"
+BACKUP_EXTRA=""
+
+
+# =============================================================================
 # Safety
 # =============================================================================
 # Allowed through before any firewall policy is tightened.
