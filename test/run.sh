@@ -66,6 +66,21 @@ echo "==> gw-egress"
 gw-egress || true
 
 echo
+echo "==> MSS clamping"
+iptables -t mangle -S FORWARD | grep -q TCPMSS \
+    && echo "  forwarded client traffic is clamped" \
+    || echo "  MSS BROKEN: no FORWARD clamp"
+miss=""
+for e in $(. /work/gateway.conf; echo "$EGRESS_PATHS"); do
+    t=$(. /work/gateway.conf; eval "echo \${EGRESS_${e}_TYPE:-}")
+    if [ -n "$t" ] && [ "$t" != direct ]; then
+        iptables -t mangle -S POSTROUTING | grep -q -- "-o out-${e} .*TCPMSS" || miss="${miss} out-${e}"
+    fi
+done
+[ -z "$miss" ] && echo "  the gateway's own tunnelled traffic is clamped too" \
+              || echo "  MSS BROKEN: no POSTROUTING clamp on:${miss}"
+
+echo
 echo "==> issue a client on every channel and re-check"
 # gw-client channels prints a table for humans; take the names from the config.
 for c in $(. /work/gateway.conf; echo "$INGRESS_CHANNELS"); do

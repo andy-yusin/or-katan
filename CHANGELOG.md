@@ -88,6 +88,21 @@ see what it makes of your config without changing the box.
   interface rather than only the one `DNS_EGRESS` names, so those queries keep
   working while that path is being carried by another.
 
+### Fixed
+
+- **MSS was clamped only on forwarded traffic.** The clamp lived in mangle
+  `FORWARD`, which never sees the gateway's own connections — and
+  `host_dns_egress` deliberately marks some of those (dnscrypt's DoH on :443,
+  the plaintext fallback on :53) onto a tunnel. A socket fixes the MSS it
+  advertises at `connect()`, from the route it had then, which is the uplink;
+  the mark moves it to a smaller-MTU device afterwards and nothing revisits the
+  MSS. The result was a SYN promising the uplink's 1460 on a 1420 path: small
+  answers arrived, large ones were dropped, and the query stalled through two
+  RTO doublings before dnsmasq's `strict-order` fell through to the next
+  server. There is now a matching clamp in mangle `POSTROUTING` on each tunnel
+  egress interface, which runs after the final routing decision and so sees the
+  device the packet really leaves by. `gw-doctor` checks for it.
+
 ### Config
 
 - Added `POLICY_<rule>_FEED` — space-separated http, https or file URLs, tried

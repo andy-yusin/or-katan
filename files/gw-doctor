@@ -261,6 +261,22 @@ grep -q "dport 53 .*DNAT" <<< "$(iptables -t nat -S PREROUTING)" \
     && pass "client DNS is redirected to the gateway" || warn "no DNS redirect — clients may use their own resolver"
 grep -q TCPMSS <<< "$(iptables -t mangle -S FORWARD)" \
     && pass "MSS clamping active" || warn "no MSS clamp — expect stalled TCP on some paths"
+# FORWARD covers traffic passing through. The gateway's own connections are
+# routed by OUTPUT and keep the MSS they chose at connect(), on the uplink,
+# even after a mark moves them onto a smaller tunnel — so they need the clamp
+# applied where the packet actually leaves.
+mss_post="$(iptables -t mangle -S POSTROUTING 2>/dev/null)"; mss_tun=0; mss_missing=""
+for e in $EGRESS_PATHS; do
+    [[ "$(eg_type "$e")" == "direct" ]] && continue
+    mss_tun=$((mss_tun+1))
+    grep -q -- "-o $(eg_iface "$e") .*TCPMSS" <<< "$mss_post" || mss_missing="${mss_missing} $(eg_iface "$e")"
+done
+if [[ "$mss_tun" -gt 0 ]]; then
+    [[ -z "$mss_missing" ]] \
+        && pass "MSS clamped on tunnel egress too (the gateway's own marked traffic)" \
+        || warn "no POSTROUTING MSS clamp on:${mss_missing}" \
+                "the gateway's own tunnelled connections will advertise the uplink MSS and stall; run: gw-routes.sh ensure"
+fi
 grep -q "dport 853 -j REJECT" <<< "$fwd" \
     && pass "DoT blocked, clients cannot bypass the gateway resolver" || warn "DoT is not blocked"
 

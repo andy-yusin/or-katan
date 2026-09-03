@@ -424,6 +424,15 @@ MTU = 1280
 
 `awg` channels default to 1340 because obfuscation adds overhead.
 
+The same fault has a second form that looks nothing like an MTU problem: DNS
+goes slow in bursts, a few percent of lookups taking around three seconds while
+the rest are instant. Those are the gateway's *own* connections, not a client's
+— `DNS_EGRESS` marks the resolver's DoH onto a tunnel, and a socket picks its
+MSS at `connect()`, before the mark reroutes it. `FORWARD` never sees them.
+`gw-doctor` reports this as a missing POSTROUTING clamp; `gw-routes.sh ensure`
+puts it back. Three seconds is the giveaway — it is two TCP retransmit
+doublings, 1s + 2s, not a slow upstream.
+
 ---
 
 ## Clients cannot see each other

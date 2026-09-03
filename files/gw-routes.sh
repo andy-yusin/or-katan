@@ -347,6 +347,22 @@ ensure_global() {
     # Without it, tunnelled TCP blackholes anywhere PMTU discovery is broken.
     ipt_append_once mangle FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
+    # FORWARD only sees packets being forwarded, so it misses the box's own
+    # connections -- and host_dns_egress deliberately marks some of those into
+    # a tunnel. A socket fixes the MSS it advertises at connect(), from the
+    # route it had then, which is the uplink; the mark moves it to a
+    # smaller-MTU device afterwards and nothing revisits the MSS. The result is
+    # a SYN promising 1460 on a 1420 path: small answers arrive, large ones are
+    # dropped, and the caller sees a multi-second stall rather than an error.
+    # POSTROUTING runs after the final routing decision, so -o names the device
+    # the packet actually leaves by.
+    local mss_e
+    for mss_e in $EGRESS_PATHS; do
+        [[ "$(eg_type "$mss_e")" == "direct" ]] && continue
+        ipt_append_once mangle POSTROUTING -o "$(eg_iface "$mss_e")" -p tcp \
+            --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    done
+
     host_dns_egress
     lan_dns
     listen_ports_open
@@ -446,6 +462,11 @@ teardown_global() {
     done
     ip route flush table "$TBL_LOCAL" 2>/dev/null || true
     ipt_delete_all mangle FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    for e in $EGRESS_PATHS; do
+        [[ "$(eg_type "$e")" == "direct" ]] && continue
+        ipt_delete_all mangle POSTROUTING -o "$(eg_iface "$e")" -p tcp \
+            --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    done
     lan_dns_teardown
     for fb in $DNS_FALLBACK; do
         ipt_delete_all mangle OUTPUT -d "$fb" -p udp --dport 53 -j MARK --set-mark "$(eg_mark "$(default_egress)")/${MARK_MASK}"
