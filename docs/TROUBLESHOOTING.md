@@ -369,6 +369,35 @@ from the LAN, so do the two `dig`s above after any change.
 
 ---
 
+## A foreign site is leaving through the local uplink
+
+A site nothing in your policy mentions takes the egress of a broad rule — a
+country rule pointing at `direct`, typically — and a geolocation check shows the
+local address. The site shares an anycast address with a domain the rule *does*
+match, and dnsmasq put that address in the rule's set when the matched name
+resolved:
+
+```bash
+ipset test gwpd_local <ip>                        # in the set, via some matched name
+whois -h whois.cymru.com " -v <ip>"               # who really owns the address
+```
+
+If the owner is a CDN or a cloud, the address is shared, and the fix is an
+exclusion — `POLICY_<rule>_EXCLUDE_FEED` pointed at the operator's published
+ranges, or `POLICY_<rule>_EXCLUDE_CIDRS` for one range. `gw-feeds update <rule>`
+loads it without waiting for the timer. Check the negative match is on every
+one of the rule's matches afterwards:
+
+```bash
+iptables -t mangle -S PREROUTING | grep "gwp.*_<rule> dst" | grep -vc gwpx_<rule>    # must be 0
+```
+
+Do not reach for the exclusion when the owner is a domestic organisation on a
+prefix the country feed happens to miss — that address is exactly what the
+rule is for, and a bank behind it will refuse the foreign exit.
+
+---
+
 ## A policy feed stopped updating
 
 The quiet one. Nothing breaks when a feed stops refreshing — the set keeps its

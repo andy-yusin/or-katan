@@ -26,6 +26,16 @@ POLICY_local_CIDRS="5.136.0.0/13 87.240.0.0/12"
 # A domestic resolver, pinned to the uplink: it returns better-located answers
 # for domestic CDNs, and these names keep resolving while a tunnel is down.
 POLICY_local_DNS="77.88.8.8"
+# Address space the rule may never claim, however a name resolved. A domestic
+# site fronted by a global CDN resolves to an anycast address shared with
+# thousands of foreign sites; without this, every one of them would leave
+# through the local uplink — and be told so by anyone geolocating that address.
+# The operators' own published lists, unioned. Domestic organisations on
+# prefixes the country allocation misses are deliberately not here: that is
+# exactly what the rule is for, and a bank behind one refuses a foreign exit.
+POLICY_local_EXCLUDE_FEED="https://www.cloudflare.com/ips-v4 https://ip-ranges.amazonaws.com/ip-ranges.json https://www.gstatic.com/ipranges/goog.json https://www.gstatic.com/ipranges/cloud.json"
+# Fastly (https://api.fastly.com/public-ip-list) belongs here too, but refuses
+# requests from inside the segment. Add it if the gateway's uplink is elsewhere.
 
 # --- video: streaming, out an exit inside the country -------------------------
 # Listed after 'local', so it wins for these names even though they are also

@@ -71,5 +71,11 @@ jobs:
           if grep -aq "HEALTH BROKEN" /tmp/out.log; then
             echo "egress failover did not behave: it invented a substitute, did not move the route, or did not put it back"; fail=1
           fi
+          if grep -aq "EXCLUDE BROKEN" /tmp/out.log; then
+            echo "a policy exclusion did not load, is missing from a marking rule, or a failed fetch changed its set"; fail=1
+          fi
+          if grep -aq "MSS BROKEN" /tmp/out.log; then
+            echo "MSS is not clamped on forwarded traffic or on the gateway's own tunnelled connections"; fail=1
+          fi
           [ "$fail" -eq 0 ] && echo "ok"
           exit "$fail"

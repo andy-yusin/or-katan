@@ -284,9 +284,9 @@ grep -q "dport 853 -j REJECT" <<< "$fwd" \
 if [[ -n "$POLICY_RULES" ]]; then
 section "destination policy"
 FEED_ANY=""
-for r in $POLICY_RULES; do [[ -n "$(cfg "POLICY_${r}_FEED")" ]] && FEED_ANY=yes; done
+for r in $POLICY_RULES; do [[ -n "$(cfg "POLICY_${r}_FEED")$(cfg "POLICY_${r}_EXCLUDE_FEED")" ]] && FEED_ANY=yes; done
 for r in $POLICY_RULES; do
-    for s in "gwp_${r}" "gwpd_${r}" "gwpf_${r}"; do
+    for s in "gwp_${r}" "gwpd_${r}" "gwpf_${r}" "gwpx_${r}"; do
         if ipset list -n 2>/dev/null | grep -qx "$s"; then
             n="$(ipset list "$s" 2>/dev/null | awk '/Number of entries/{print $4}')"
             pass "ipset ${s} (${n} entries)"
@@ -297,6 +297,22 @@ for r in $POLICY_RULES; do
     # A feed that has stopped refreshing is the quiet failure this whole check
     # exists for: the set keeps its last good contents, so nothing looks broken
     # while the list silently ages out of date.
+    # Same quiet failure for an exclusion list, with the opposite consequence:
+    # as it ages, addresses the rule should have left alone drift back into it.
+    xfeed="$(cfg "POLICY_${r}_EXCLUDE_FEED")"
+    if [[ -n "$xfeed" ]]; then
+        xf="/var/lib/gateway/feeds/${r}.exclude.list"
+        if [[ ! -s "$xf" ]]; then
+            fail "exclusions for '${r}' have never been fetched" "gw-feeds update ${r}"
+        else
+            age=$(( ( $(date +%s) - $(stat -c %Y "$xf" 2>/dev/null || echo 0) ) / 86400 ))
+            if [[ "$age" -le 7 ]]; then
+                pass "exclusions ${r}: refreshed ${age}d ago"
+            else
+                warn "exclusions ${r}: last refreshed ${age}d ago" "systemctl status gw-feeds.timer; gw-feeds update ${r}"
+            fi
+        fi
+    fi
     feed="$(cfg "POLICY_${r}_FEED")"
     [[ -n "$feed" ]] || continue
     sf="/var/lib/gateway/feeds/${r}.list"

@@ -129,6 +129,35 @@ if grep -q "^POLICY_[a-z_]*_FEED=" /work/gateway.conf; then
     gw-config --no-apply set "POLICY_${fr}_FEED" "file:///work/test/fixtures/policy-feed.list" >/dev/null 2>&1 || true
 fi
 
+# Only the fixtures that hold a rule back from some address space exercise this.
+if grep -q "^POLICY_[a-z_]*_EXCLUDE_FEED=" /work/gateway.conf; then
+    echo
+    echo "==> policy exclusions"
+    xr=$(grep -oE "^POLICY_[a-z_]+_EXCLUDE_FEED=" /work/gateway.conf | sed -E "s/^POLICY_(.*)_EXCLUDE_FEED=$/\1/" | head -1)
+    n=$(ipset list "gwpx_${xr}" 2>/dev/null | awk "/Number of entries/{print \$4}") || n=0
+    # Two prefixes from the list plus one static EXCLUDE_CIDRS; the private range is dropped.
+    [ "${n:-0}" = "3" ] && echo "  ${xr}: ${n} prefixes excluded, the private range dropped" \
+                        || echo "  EXCLUDE BROKEN: gwpx_${xr} holds ${n:-0}, expected 3"
+    # Every one of the rule's matches must carry the negative match, and none may be without it.
+    have=$(iptables -t mangle -S PREROUTING | grep -c "match-set gwp[df]*_${xr} dst -m set ! --match-set gwpx_${xr} dst") || have=0
+    bare=$(iptables -t mangle -S PREROUTING | grep "match-set gwp[df]*_${xr} dst" | grep -vc "gwpx_${xr}") || bare=0
+    [ "$have" -ge 3 ] && [ "$bare" = "0" ] && echo "  all ${have} matches for '${xr}' carry the exclusion" \
+                                           || echo "  EXCLUDE BROKEN: ${have} matches carry it, ${bare} do not"
+    ipset test "gwpx_${xr}" 198.18.7.1 >/dev/null 2>&1 && ipset test "gwpf_${xr}" 198.18.7.1 >/dev/null 2>&1 \
+        && echo "  198.18.7.1 is in the feed and in the exclusion — the exclusion wins" \
+        || echo "  EXCLUDE BROKEN: 198.18.7.1 should be in both gwpf_${xr} and gwpx_${xr}"
+    ipset test "gwpx_${xr}" 192.0.2.1 >/dev/null 2>&1 && ipset test "gwp_${xr}" 192.0.2.1 >/dev/null 2>&1 \
+        && echo "  a static seed is held back by a static exclusion too" \
+        || echo "  EXCLUDE BROKEN: 192.0.2.1 should be in both gwp_${xr} and gwpx_${xr}"
+    # A source that stops answering must leave its last good copy in place.
+    mv /work/test/fixtures/policy-exclude.list /work/test/fixtures/policy-exclude.list.gone
+    gw-feeds update "$xr" >/dev/null 2>&1 || true
+    n2=$(ipset list "gwpx_${xr}" 2>/dev/null | awk "/Number of entries/{print \$4}") || n2=0
+    mv /work/test/fixtures/policy-exclude.list.gone /work/test/fixtures/policy-exclude.list
+    [ "${n2:-0}" = "3" ] && echo "  a dead exclusion source keeps its last good copy" \
+                         || echo "  EXCLUDE BROKEN: a failed fetch changed the set (${n2:-0} left)"
+fi
+
 # Only the fixtures that give a path somewhere to go exercise this.
 if grep -q "^EGRESS_[a-z_]*_FAILOVER=" /work/gateway.conf; then
     echo

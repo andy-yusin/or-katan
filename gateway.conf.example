@@ -261,6 +261,32 @@ POLICY_RULES=""
 # cached on disk, so a reboot does not leave the set empty until the timer next
 # fires.
 
+# --- Exclusions: what a rule must never claim ---------------------------------
+# A rule matches by address, and addresses are shared. A domain the rule covers
+# that is fronted by a big CDN resolves to an anycast address serving thousands
+# of unrelated sites; dnsmasq drops that address into the rule's set, and from
+# then on every one of those sites takes the rule's egress. On a rule pointing
+# at the local uplink that means foreign sites leaving through the local
+# address — and being told so by anyone who geolocates it. The exclusion is
+# address space the rule may never claim, however it matched:
+#
+#   POLICY_local_EXCLUDE_FEED="https://example.org/cdn-a.txt https://example.net/cloud-b.txt"
+#   POLICY_local_EXCLUDE_CIDRS="203.0.113.0/24"
+#
+# Unlike FEED, these URLs are not alternatives: each operator publishes its own
+# ranges, so every list is fetched and the set is their union. A source that
+# stops answering contributes its last good copy; one that has never answered
+# is left out and the set is built from the rest. There is no FEED_MIN here —
+# a thin exclusion returns some addresses to the rule, which is where they were
+# before, not a leak.
+#
+# An excluded destination is not sent anywhere in particular: it falls back to
+# whatever its channel would do anyway. That is the difference from listing an
+# exception rule after this one, which would force those addresses out one
+# named egress for every channel. The operators' own published lists are the
+# right sources; profiles/ru.profile carries the ones for the major CDNs and
+# clouds. Refreshed by gw-feeds on the same timer, cached the same way.
+
 # When the feeds refresh. Any systemd OnCalendar expression — "daily",
 # "weekly", "*-*-* 03:00:00". An hour of random delay is added so everyone
 # pointed at the same public list does not hit it on the same second.

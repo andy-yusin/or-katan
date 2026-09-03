@@ -154,6 +154,23 @@ for r in $POLICY_RULES; do
         [[ -z "$m" || "$m" =~ ^[0-9]+$ ]] || die "POLICY_${r}_FEED_MIN must be a number"
         FEED_RULES="${FEED_RULES}${FEED_RULES:+ }${r}"
     fi
+    # An exclusion list is fetched the same way and is the same kind of routing
+    # decision; it just lands on the other side of the match.
+    xfeed="$(cfg "POLICY_${r}_EXCLUDE_FEED")"
+    if [[ -n "$xfeed" ]]; then
+        for u in $xfeed; do
+            [[ "$u" =~ ^(https?|file)://[^[:space:]]+$ ]] \
+                || die "POLICY_${r}_EXCLUDE_FEED entry '${u}' must be an http, https or file URL"
+            if [[ "$u" =~ ^http:// ]]; then
+                warn "POLICY_${r}_EXCLUDE_FEED '${u}' is plain http — whoever can rewrite that response chooses your routing"
+            fi
+        done
+        [[ " ${FEED_RULES} " == *" ${r} "* ]] || FEED_RULES="${FEED_RULES}${FEED_RULES:+ }${r}"
+    fi
+    for xc in $(cfg "POLICY_${r}_EXCLUDE_CIDRS"); do
+        [[ "$xc" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$ ]] \
+            || die "POLICY_${r}_EXCLUDE_CIDRS entry '${xc}' is not a CIDR"
+    done
 done
 # Quoted into a variable: an unquoted =~ pattern containing a space does not
 # parse as one regex.

@@ -1,0 +1,6 @@
+# Test exclusion list for test/run.sh — two prefixes inside the feed's own range
+# (198.18.0.0/15, RFC 2544), so the run can prove a negative match beats a
+# positive one, plus a private range the sanitiser must drop.
+198.18.7.0/24
+198.18.8.0/24
+10.0.0.0/8

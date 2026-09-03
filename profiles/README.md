@@ -46,6 +46,9 @@ POLICY_<rule>_EGRESS="..."
 POLICY_<rule>_DOMAINS="..."
 POLICY_<rule>_CIDRS="..."
 POLICY_<rule>_DNS="..."
+POLICY_<rule>_FEED="..."            — published lists, tried in order
+POLICY_<rule>_EXCLUDE_FEED="..."    — published lists the rule may never claim, unioned
+POLICY_<rule>_EXCLUDE_CIDRS="..."
 ```
 
 Drop the file in `/etc/gateway/profiles/` (or here, before installing) and it

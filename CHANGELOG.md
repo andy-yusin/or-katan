@@ -37,6 +37,26 @@ see what it makes of your config without changing the box.
   set size, how long since the last successful refresh, and whether the timer is
   enabled.
 
+- **Policy exclusions.** Address space a destination-policy rule may never
+  claim, however it matched. Addresses are shared: a domain a rule covers,
+  fronted by a big CDN, resolves to an anycast address serving thousands of
+  unrelated sites, dnsmasq drops that address into the rule's set, and from
+  then on every one of those sites takes the rule's egress — on a rule pointing
+  at the local uplink, foreign sites leaving through the local address and
+  being told so by anyone who geolocates it. Ordering cannot express the fix:
+  an exception rule picks one egress for every channel, when what is wanted is
+  for the broad rule simply not to claim those addresses.
+
+  A fourth ipset, `gwpx_<rule>`, is carried by each of the rule's three
+  marking rules as a negative match (not a `RETURN`, which would end the chain
+  and break last-match-wins for anything listed after). An excluded
+  destination falls back to its channel default. `gw-feeds` fills it from
+  `POLICY_<rule>_EXCLUDE_FEED`, whose sources are unioned rather than tried in
+  turn — each operator publishes its own ranges — with a per-source cache so
+  one list going dark leaves the others current. `profiles/ru.profile` now
+  ships the major CDN and cloud lists on its `local` rule; without them it had
+  exactly this leak. `gw-doctor` checks the set and the list's age.
+
 - **Egress failover.** An egress path can name others to carry its traffic when
   it stops working. A timer probes each watched path by fetching a URL bound to
   that path's own interface — so a tunnel that is up and handshaking but not
@@ -84,6 +104,9 @@ see what it makes of your config without changing the box.
 - `gw-routes.sh` accepts `ensure`, which re-asserts the global routing state
   without naming a channel. It is how a failover becomes a route, and the
   smallest thing that repairs flushed policy rules.
+- Every destination-policy marking rule now carries `! --match-set gwpx_<rule>`.
+  On upgrade, `gw-routes.sh` removes the old shape of each rule before
+  appending the new one, so nothing is duplicated and nobody is disconnected.
 - The gateway's own DNS is now MASQUERADEd out of every declared egress
   interface rather than only the one `DNS_EGRESS` names, so those queries keep
   working while that path is being carried by another.
@@ -111,6 +134,10 @@ see what it makes of your config without changing the box.
   failure. Default 100.
 - Added `POLICY_FEED_SCHEDULE` — any systemd `OnCalendar` expression. Default
   `daily`, with an hour of randomised delay.
+- Added `POLICY_<rule>_EXCLUDE_FEED` — space-separated http, https or file
+  URLs, all fetched and unioned. Declaring it on any rule installs the feeds
+  timer, as `_FEED` does.
+- Added `POLICY_<rule>_EXCLUDE_CIDRS` — static ranges the rule may never claim.
 - Added `EGRESS_<path>_FAILOVER` — other paths, in preference order, to carry
   this one when it fails. Unset means the path is never moved and never used as
   a substitute. Declaring it on any path is what installs the health timer.

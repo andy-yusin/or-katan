@@ -65,7 +65,7 @@ because the next install regenerates it.
 | `files/gw-egress` | Inspect, switch, add and remove egress paths. |
 | `files/gw-config` | Read/write config keys, apply profiles, validate, apply. |
 | `files/gw-doctor` | Layered health check. Start here when debugging. |
-| `files/gw-feeds` | Fetches the address lists policy rules subscribe to. Run by a timer. |
+| `files/gw-feeds` | Fetches the address lists policy rules subscribe to, and the ones they must exclude. Run by a timer. |
 | `files/gw-health` | Probes each egress path and carries a failed one on another. Run by a timer. |
 | `files/gw-backup` | Snapshots what a rebuild needs, and restores it. Run by a timer. Its archives hold every private key on the box. |
 | `files/gw-lib.sh` | Helpers used by more than one tool: the config writer (`gw-config`, `gw-egress`) and the failover-substitution reader (`gw-egress`, `gw-doctor`). Sourced, never run. Anything that writes `gateway.conf` belongs here, not in a second copy. |
@@ -121,8 +121,9 @@ can be re-applied without the clone it came from.
 
 Interfaces are `in-<channel>` and `out-<egress>`. Routing tables are
 `gw_<egress>`. ipsets are `gwp_<rule>` for static CIDRs, `gwpd_<rule>` for
-what dnsmasq fills as names resolve, and `gwpf_<rule>` for what `gw-feeds`
-fetches. Config keys are
+what dnsmasq fills as names resolve, `gwpf_<rule>` for what `gw-feeds`
+fetches, and `gwpx_<rule>` for what the rule may never claim — a negative match
+carried by all three of the others, never a `RETURN`. Config keys are
 `INGRESS_<channel>_<FIELD>`, `EGRESS_<egress>_<FIELD>`,
 `POLICY_<rule>_<FIELD>` — read with bash indirect expansion (`${!var}`), which
 is why channel and egress names must match `^[a-z][a-z0-9_]*$`.

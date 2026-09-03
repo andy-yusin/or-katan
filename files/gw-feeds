@@ -14,10 +14,25 @@
 #   gwpd_<rule>   what dnsmasq drops in as the rule's domains resolve
 #   gwpf_<rule>   this file: a list fetched from POLICY_<rule>_FEED
 #
+# and is held back by a fourth, which every match carries as a negative:
+#
+#   gwpx_<rule>   what the rule may never claim, however it matched —
+#                 POLICY_<rule>_EXCLUDE_CIDRS plus the lists named in
+#                 POLICY_<rule>_EXCLUDE_FEED. Addresses are shared: a domain
+#                 the rule covers, fronted by a big CDN, resolves to an anycast
+#                 address serving thousands of unrelated sites, and without
+#                 this every one of them would take the rule's egress.
+#
 # The feed exists for destinations reached by address before any name is
 # resolved, in numbers too large to hand-maintain — a country's allocations, a
 # provider's ranges. Nothing else about the rule changes: the mark, the egress
 # and the iptables rules are the same whichever set matched.
+#
+# Exclusion sources are unioned, not tried in turn: each operator publishes its
+# own ranges. A source that stops answering contributes its last good copy; one
+# that has never answered is left out and the set is built from the rest. The
+# asymmetry with feeds is deliberate — a thin exclusion returns some addresses
+# to the rule, which is where they were before exclusions existed.
 #
 # Failing closed here means keeping the list that is already loaded. A feed that
 # 404s, returns an error page, or comes back suspiciously short must never be
@@ -59,12 +74,25 @@ cfg()          { local v="$1"; echo "${!v-}"; }
 pol_feed()     { cfg "POLICY_${1}_FEED"; }
 pol_feed_min() { local m; m="$(cfg "POLICY_${1}_FEED_MIN")"; echo "${m:-$DEFAULT_MIN}"; }
 pol_setf()     { echo "gwpf_$1"; }
+pol_xfeed()    { cfg "POLICY_${1}_EXCLUDE_FEED"; }
+pol_xcidrs()   { cfg "POLICY_${1}_EXCLUDE_CIDRS"; }
+pol_setx()     { echo "gwpx_$1"; }
 state_file()   { echo "${STATE_DIR}/${1}.list"; }
+xstate_file()  { echo "${STATE_DIR}/${1}.exclude.list"; }
+xcache_dir()   { echo "${STATE_DIR}/exclude/${1}"; }
+url_key()      { printf '%s' "$1" | md5sum | cut -c1-16; }
 
 feed_rules() {
     local r
     for r in $POLICY_RULES; do
         [[ -n "$(pol_feed "$r")" ]] && printf '%s\n' "$r"
+    done
+    return 0
+}
+exclude_rules() {
+    local r
+    for r in $POLICY_RULES; do
+        [[ -n "$(pol_xfeed "$r")" ]] && printf '%s\n' "$r"
     done
     return 0
 }
@@ -82,9 +110,8 @@ sanitise() {
 # makes this safe to run against a gateway carrying traffic: there is no window
 # in which the set is empty and the policy rule stops matching.
 load_set() {
-    local rule="$1" list="$2" count="$3"
-    local live tmp
-    live="$(pol_setf "$rule")"
+    local live="$1" rule="$2" list="$3" count="$4"
+    local tmp
     tmp="${live}_new"
 
     ipset create "$live" "${IPSET_SPEC[@]}" -exist
@@ -128,7 +155,7 @@ update_rule() {
             warn "${rule}: ${url} returned ${count} prefixes, below the ${min} minimum"
             continue
         fi
-        if load_set "$rule" "$clean" "$count"; then
+        if load_set "$(pol_setf "$rule")" "$rule" "$clean" "$count"; then
             mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
             cp "$clean" "$(state_file "$rule")"
             return 0
@@ -153,16 +180,77 @@ restore_rule() {
         return 0
     fi
     count="$(wc -l < "$sf" | tr -d ' ')"
-    load_set "$rule" "$sf" "$count"
+    load_set "$(pol_setf "$rule")" "$rule" "$sf" "$count"
+}
+
+update_exclude() {
+    local rule="$1"
+    local urls tmpdir raw clean union url key keys cache c n f
+    urls="$(pol_xfeed "$rule")"
+    tmpdir="$(mktemp -d)"
+    raw="${tmpdir}/raw"; clean="${tmpdir}/clean"; union="${tmpdir}/union"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmpdir'" RETURN
+    mkdir -p "$(xcache_dir "$rule")"; chmod 700 "$STATE_DIR" "$(xcache_dir "$rule")"
+    : > "$union"; keys=""
+
+    for url in $urls; do
+        key="$(url_key "$url")"; keys="${keys} ${key}"
+        cache="$(xcache_dir "$rule")/${key}.list"
+        if curl -sfL --connect-timeout 10 --max-time 120 "$url" -o "$raw" \
+           && sanitise "$raw" > "$clean" && [[ -s "$clean" ]]; then
+            cp "$clean" "$cache"
+            ok "${rule}: exclusion ${url}: $(wc -l < "$clean" | tr -d ' ') prefixes"
+        elif [[ -s "$cache" ]]; then
+            warn "${rule}: exclusion ${url} did not answer; using its last good copy"
+        else
+            warn "${rule}: exclusion ${url} did not answer and never has; left out"
+            continue
+        fi
+        cat "$cache" >> "$union"
+    done
+    # The static ranges ride along, so the swap below cannot drop them.
+    for c in $(pol_xcidrs "$rule"); do
+        if [[ "$c" =~ $CIDR_RE ]]; then printf '%s\n' "$c" >> "$union"; fi
+    done
+    sort -u -o "$union" "$union"
+    n="$(grep -c . "$union")" || n=0
+    if [[ "$n" -eq 0 ]]; then
+        err "${rule}: no exclusion source answered; keeping what is loaded"
+        return 1
+    fi
+    load_set "$(pol_setx "$rule")" "${rule} (exclusions)" "$union" "$n" || return 1
+    cp "$union" "$(xstate_file "$rule")"
+    # Copies kept for sources no longer listed would otherwise linger forever.
+    for f in "$(xcache_dir "$rule")"/*.list; do
+        [[ -e "$f" ]] || continue
+        key="${f##*/}"; key="${key%.list}"
+        [[ " ${keys} " == *" ${key} "* ]] || rm -f "$f"
+    done
+    return 0
+}
+
+restore_exclude() {
+    local rule="$1" sf count
+    sf="$(xstate_file "$rule")"
+    if [[ ! -s "$sf" ]]; then
+        ipset create "$(pol_setx "$rule")" "${IPSET_SPEC[@]}" -exist
+        return 0
+    fi
+    count="$(wc -l < "$sf" | tr -d ' ')"
+    load_set "$(pol_setx "$rule")" "${rule} (exclusions)" "$sf" "$count"
 }
 
 cmd_update() {
     local rules="$*" r rc=0
-    [[ -n "$rules" ]] || rules="$(feed_rules | tr '\n' ' ')"
+    [[ -n "$rules" ]] || rules="$( (feed_rules; exclude_rules) | sort -u | tr '\n' ' ')"
     [[ -n "${rules// /}" ]] || { log "no policy rule subscribes to a feed"; return 0; }
     for r in $rules; do
-        [[ -n "$(pol_feed "$r")" ]] || { err "policy '${r}' has no POLICY_${r}_FEED"; rc=1; continue; }
-        update_rule "$r" || rc=1
+        if [[ -z "$(pol_feed "$r")" && -z "$(pol_xfeed "$r")" ]]; then
+            err "policy '${r}' has neither POLICY_${r}_FEED nor POLICY_${r}_EXCLUDE_FEED"; rc=1; continue
+        fi
+        [[ -z "$(pol_feed "$r")" ]]  || update_rule "$r"    || rc=1
+        [[ -z "$(pol_xfeed "$r")" ]] || update_exclude "$r" || rc=1
     done
     return "$rc"
 }
@@ -170,6 +258,7 @@ cmd_update() {
 cmd_restore() {
     local r
     for r in $(feed_rules); do restore_rule "$r" || true; done
+    for r in $(exclude_rules); do restore_exclude "$r" || true; done
     return 0
 }
 
@@ -186,6 +275,17 @@ cmd_status() {
         fi
         printf '%-14s %10s %12s  %s%s%s\n' "$r" "$n" "$age" \
             "$DIM" "$(pol_feed "$r" | awk '{print $1}')" "$NC"
+    done
+    for r in $(exclude_rules); do
+        n="$(ipset list "$(pol_setx "$r")" 2>/dev/null | grep -cE "$CIDR_RE")" || n=0
+        sf="$(xstate_file "$r")"
+        if [[ -f "$sf" ]]; then
+            age="$(( ( $(date +%s) - $(stat -c %Y "$sf" 2>/dev/null || echo 0) ) / 3600 ))h"
+        else
+            age="never"
+        fi
+        printf '%-14s %10s %12s  %s%s%s\n' "${r}/exclude" "$n" "$age" \
+            "$DIM" "$(pol_xfeed "$r" | awk '{printf "%s (+%d more)", $1, NF-1}')" "$NC"
     done
     return 0
 }

@@ -76,6 +76,7 @@ rule's egress:
 | `gwp_<rule>` | `POLICY_<rule>_CIDRS`, rebuilt from config on every bring-up | a handful |
 | `gwpd_<rule>` | dnsmasq, as the rule's domains resolve | hundreds |
 | `gwpf_<rule>` | `gw-feeds`, from `POLICY_<rule>_FEED` on a timer | tens of thousands |
+| `gwpx_<rule>` | `POLICY_<rule>_EXCLUDE_CIDRS` on bring-up, plus `gw-feeds` from `POLICY_<rule>_EXCLUDE_FEED` — a negative match on the other three | thousands |
 
 ```
 ipset=/bank.example/tax.gov.example/gwpd_home
@@ -119,6 +120,27 @@ Everything about that path is built so a bad fetch cannot change routing:
 `gw-doctor` reports the set size, how long since the last successful refresh,
 and whether the timer is enabled. A feed that has stopped refreshing is the
 quiet failure worth watching for: nothing breaks, the list just ages.
+
+### Exclusions
+
+Addresses are shared. A domain a rule covers, fronted by a big CDN, resolves to
+an anycast address serving thousands of unrelated sites, and every one of them
+would take the rule's egress. `gwpx_<rule>` is address space the rule may never
+claim, and each of the rule's three marking rules carries it as a negative
+match (`-m set ! --match-set gwpx_<rule> dst`).
+
+It is a negative match rather than a `RETURN` placed above the rule because a
+`RETURN` ends the chain for every packet to that address, and a rule listed
+later could no longer claim it — the last-match-wins ordering would break
+silently. An excluded destination is not sent anywhere: it falls back to its
+channel default, which is also why this is not expressible as an exception rule
+(that would pick one egress for every channel).
+
+`gw-feeds` fills it from `POLICY_<rule>_EXCLUDE_FEED`, whose URLs are unioned
+rather than tried in turn — each operator publishes its own ranges — with a
+per-source cache so one list going dark leaves the others current. There is no
+minimum: a thin exclusion returns some addresses to the rule, which is where
+they were before exclusions existed, not a leak.
 
 ## Isolation
 

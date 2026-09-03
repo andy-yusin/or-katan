@@ -118,6 +118,8 @@ pol_cidrs()  { cfg "POLICY_${1}_CIDRS"; }
 pol_set()    { echo "gwp_$1"; }      # static CIDR seeds
 pol_setd()   { echo "gwpd_$1"; }     # populated live by dnsmasq
 pol_setf()   { echo "gwpf_$1"; }     # fetched from POLICY_<rule>_FEED by gw-feeds
+pol_setx()   { echo "gwpx_$1"; }     # what the rule may never claim: EXCLUDE_CIDRS + EXCLUDE_FEED
+pol_xcidrs() { cfg "POLICY_${1}_EXCLUDE_CIDRS"; }
 
 default_egress() { echo "$EGRESS_PATHS" | awk '{print $1}'; }
 
@@ -326,9 +328,17 @@ ensure_global() {
         # one in gw-feeds: `ipset swap` refuses two sets created differently,
         # and the symptom is a feed that appears to run and never updates.
         ipset create "$(pol_setf "$r")" hash:net family inet hashsize 4096 maxelem 262144 -exist
+        # Address space the rule may never claim, however it matched. Same spec
+        # as the feed set, for the same swap reason; gw-feeds unions the fetched
+        # lists with the static ranges below, so both writers agree on contents.
+        ipset create "$(pol_setx "$r")" hash:net family inet hashsize 4096 maxelem 262144 -exist
         local cidr
         for cidr in $(pol_cidrs "$r"); do
             ipset add "$s" "$cidr" -exist 2>/dev/null || log "WARN: bad CIDR in POLICY_${r}_CIDRS: $cidr"
+        done
+        for cidr in $(pol_xcidrs "$r"); do
+            ipset add "$(pol_setx "$r")" "$cidr" -exist 2>/dev/null \
+                || log "WARN: bad CIDR in POLICY_${r}_EXCLUDE_CIDRS: $cidr"
         done
         # Keep the resolver for these names on the local uplink, so lookups for
         # them still work while a tunnel egress is down.
@@ -562,12 +572,19 @@ setup_channel() {
             log "WARN: policy '${r}' names undeclared egress '${target}'; skipping"
             continue
         fi
-        ipt_append_once mangle PREROUTING -i "$iface" \
-            -m set --match-set "$(pol_set "$r")" dst -j MARK --set-mark "$(eg_mark "$target")/${MARK_MASK}"
-        ipt_append_once mangle PREROUTING -i "$iface" \
-            -m set --match-set "$(pol_setd "$r")" dst -j MARK --set-mark "$(eg_mark "$target")/${MARK_MASK}"
-        ipt_append_once mangle PREROUTING -i "$iface" \
-            -m set --match-set "$(pol_setf "$r")" dst -j MARK --set-mark "$(eg_mark "$target")/${MARK_MASK}"
+        # Every match carries the rule's exclusion set as a negative match. Not
+        # a RETURN placed above the rule: that would end the chain for every
+        # packet to an excluded address, and a rule listed later could no
+        # longer claim it — the last-match-wins ordering would silently break.
+        local pmark pset
+        pmark="$(eg_mark "$target")/${MARK_MASK}"
+        for pset in "$(pol_set "$r")" "$(pol_setd "$r")" "$(pol_setf "$r")"; do
+            # The shape from before exclusions existed, if an upgrade left it.
+            ipt_delete_all mangle PREROUTING -i "$iface" -m set --match-set "$pset" dst -j MARK --set-mark "$pmark"
+            ipt_append_once mangle PREROUTING -i "$iface" \
+                -m set --match-set "$pset" dst -m set ! --match-set "$(pol_setx "$r")" dst \
+                -j MARK --set-mark "$pmark"
+        done
     done
 
     # --- Reachability -------------------------------------------------------
@@ -675,12 +692,14 @@ teardown_channel() {
     for r in $POLICY_RULES; do
         target="$(pol_egress "$r")"
         eg_index "$target" >/dev/null 2>&1 || continue
-        ipt_delete_all mangle PREROUTING -i "$iface" -m set --match-set "$(pol_set "$r")" dst \
-            -j MARK --set-mark "$(eg_mark "$target")/${MARK_MASK}"
-        ipt_delete_all mangle PREROUTING -i "$iface" -m set --match-set "$(pol_setd "$r")" dst \
-            -j MARK --set-mark "$(eg_mark "$target")/${MARK_MASK}"
-        ipt_delete_all mangle PREROUTING -i "$iface" -m set --match-set "$(pol_setf "$r")" dst \
-            -j MARK --set-mark "$(eg_mark "$target")/${MARK_MASK}"
+        local pmark pset
+        pmark="$(eg_mark "$target")/${MARK_MASK}"
+        for pset in "$(pol_set "$r")" "$(pol_setd "$r")" "$(pol_setf "$r")"; do
+            ipt_delete_all mangle PREROUTING -i "$iface" -m set --match-set "$pset" dst -j MARK --set-mark "$pmark"
+            ipt_delete_all mangle PREROUTING -i "$iface" \
+                -m set --match-set "$pset" dst -m set ! --match-set "$(pol_setx "$r")" dst \
+                -j MARK --set-mark "$pmark"
+        done
     done
 
     if [[ -n "$gw" ]]; then

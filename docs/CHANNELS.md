@@ -188,6 +188,38 @@ ipset test gwpd_exception <ip>
 ip route get <ip> from 10.30.10.2 iif in-family mark 0
 ```
 
+### What a rule must never claim
+
+A rule matches by address, and addresses are shared. Take a broad rule sending
+a country's domains out `direct`. One of those domains is fronted by a global
+CDN, so it resolves to an anycast address serving thousands of unrelated sites;
+dnsmasq drops that address into `gwpd_<rule>`, and from then on every one of
+those sites leaves through the local uplink too — and is told so by anyone who
+geolocates that address. Ordering cannot fix this: an exception rule would force
+those addresses out one named egress for every channel, when what you want is
+for the broad rule simply not to claim them.
+
+That is what an exclusion is — address space the rule may never claim, however
+it matched:
+
+```ini
+POLICY_local_EXCLUDE_FEED="https://example.org/cdn-a.txt https://example.net/cloud-b.txt"
+POLICY_local_EXCLUDE_CIDRS="203.0.113.0/24"
+```
+
+Unlike `FEED`, these URLs are not alternatives: each operator publishes its own
+ranges, so every list is fetched and the set (`gwpx_<rule>`) is their union. An
+excluded destination falls back to whatever its channel would do anyway. The
+operators' own published lists are the right sources; `profiles/ru.profile`
+carries the ones for the major CDNs and clouds.
+
+Verify that an address is held back, and that every match carries the check:
+
+```bash
+ipset test gwpx_local <ip>
+iptables -t mangle -S PREROUTING | grep "gwp.*_local dst -m set ! --match-set gwpx_local"
+```
+
 ## A worked example
 
 A household gateway with an exit abroad, a second exit for one geo-locked
