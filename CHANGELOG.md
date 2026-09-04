@@ -17,6 +17,14 @@ see what it makes of your config without changing the box.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-09-04
+
+What a gateway needs once it has been running for a while: address lists it
+does not maintain by hand, and what those lists must never include; an exit
+that hands its traffic to another when it stops working; snapshots of what a
+rebuild cannot regenerate; and a clamp on the MSS of the gateway's own
+tunnelled connections, which nothing had been clamping.
+
 ### Added
 
 - **Policy feeds.** A destination-policy rule can subscribe to a published CIDR
@@ -110,6 +118,8 @@ see what it makes of your config without changing the box.
 - The gateway's own DNS is now MASQUERADEd out of every declared egress
   interface rather than only the one `DNS_EGRESS` names, so those queries keep
   working while that path is being carried by another.
+- CI checks the tree out with `actions/checkout@v7`. v4 ran on Node 20, which
+  GitHub is retiring from its runners.
 
 ### Fixed
 
@@ -217,5 +227,6 @@ The whole schema is new. Every key is documented in
   that obfuscation defeats any particular DPI, or that a real handshake
   completes over a real network.
 
-[Unreleased]: https://github.com/andy-yusin/or-katan/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/andy-yusin/or-katan/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/andy-yusin/or-katan/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/andy-yusin/or-katan/releases/tag/v0.1.0
